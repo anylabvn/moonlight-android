@@ -51,8 +51,10 @@ public class StartupTest {
     @Test
     public void testApplicationStartup() {
         // Test ArtemisApplication creation and initialization
-        ArtemisApplication app = new ArtemisApplication();
-        app.onCreate();
+        // Exercise Android-managed Application creation with an attached Context.
+        ArtemisApplication app =
+                Robolectric.buildApplication(ArtemisApplication.class).create().get();
+        assertNotNull(app);
 
         // Verify ProfilesManager was initialized
         ProfilesManager manager = ProfilesManager.getInstance();
