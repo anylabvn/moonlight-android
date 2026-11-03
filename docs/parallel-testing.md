@@ -67,3 +67,26 @@ testing multi-client host behavior.
   reattachment and reconnect after network loss.
 - CI must pass all Debug, Release and Release Test unit tests; build and
   signing failures must fail the job.
+
+## Escape key behavior during streaming
+
+Physical keyboard `Esc` is a **remote key**, not a client shortcut for
+opening the Artemis quick menu. The streaming Activity intercepts Android
+`KEYCODE_ESCAPE` on press and release before ungrabbed/synthetic key filters
+could let Android remap it to Back. It also recognizes keyboard-only
+`KEYCODE_BACK` fallbacks (or the Linux ESC scan code) produced by vendor
+keymaps. When input is grabbed, the Escape press and release are forwarded
+to the Apollo/Windows host as the Escape virtual key. When input is ungrabbed,
+Escape is consumed without sending it to the host or opening the menu.
+
+**Do not intercept actual Android Back navigation**, controller Back or mouse
+right-click synthetic Back. The floating session-menu button, five-finger
+touch gesture and intentional Android Back navigation retain their existing
+behavior.
+
+On-device checks: press/release Esc while streaming, with input grabbed and
+ungrabbed; ensure it never opens the session menu. Verify the host receives
+Esc when input is grabbed, and the floating/touch menu mechanisms still work.
+Verify Back from Android navigation remains distinct. Keyboard remapping by
+MIUI or external software that never delivers a key event to the app cannot
+be validated by unit tests.

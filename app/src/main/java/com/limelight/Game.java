@@ -13,6 +13,7 @@ import com.limelight.binding.audio.AndroidAudioRenderer;
 import com.limelight.binding.input.ControllerHandler;
 import com.limelight.binding.input.GameInputDevice;
 import com.limelight.binding.input.KeyboardTranslator;
+import com.limelight.binding.input.StreamEscapeKeyPolicy;
 import com.limelight.binding.input.capture.InputCaptureManager;
 import com.limelight.binding.input.capture.InputCaptureProvider;
 import com.limelight.binding.input.touch.AbsoluteTouchContext;
@@ -2130,6 +2131,34 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         return (byte) modifierFlags;
     }
 
+    /**
+     * Keep keyboard Escape from falling back to Android Back navigation.
+     *
+     * Android key character maps can redispatch unhandled Escape as Back,
+     * which opens Artemis's session menu through onBackPressed(). Handle
+     * Escape before the synthetic-key and input-grab filters, and keep
+     * physical/system Back navigation unchanged.
+     */
+    private boolean handleStreamEscapeKey(KeyEvent event, boolean down) {
+        if (!StreamEscapeKeyPolicy.isRemoteEscape(event)) {
+            return false;
+        }
+
+        // Preserve the existing Ctrl+Alt+Shift client shortcut state.
+        if (handleSpecialKeys(KeyEvent.KEYCODE_ESCAPE, down)) {
+            return true;
+        }
+
+        // If keyboard input is released to Android, consume Escape to prevent
+        // Back fallback but do not inject an ungrabbed key into the host.
+        if (grabbedInput && conn != null && (!down || event.getRepeatCount() == 0)) {
+            conn.sendKeyboardInput((short) KeyboardTranslator.VK_ESCAPE,
+                    down ? KeyboardPacket.KEY_DOWN : KeyboardPacket.KEY_UP,
+                    getModifierState(event), (byte) 0);
+        }
+        return true;
+    }
+
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         return handleKeyDown(event) || super.onKeyDown(keyCode, event);
@@ -2137,6 +2166,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyDown(KeyEvent event) {
+        if (handleStreamEscapeKey(event, true)) {
+            return true;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
@@ -2228,6 +2261,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyUp(KeyEvent event) {
+        if (handleStreamEscapeKey(event, false)) {
+            return true;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
