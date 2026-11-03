@@ -9,7 +9,6 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
-import org.robolectric.Robolectric;
 import org.robolectric.annotation.Config;
 
 import java.io.File;
@@ -57,11 +56,12 @@ public class SimpleStartupTest {
         // Test application onCreate which initializes ProfilesManager
         // After the fix, this should no longer crash
         try {
-            // Robolectric attaches a valid Context before invoking onCreate().
-            // Constructing an Application with 'new' never does this.
+            // Use the Android-created Application with its attached Context.
+            // Invoking onCreate after resetting ProfilesManager tests initialization.
             ArtemisApplication app =
-                    Robolectric.buildApplication(ArtemisApplication.class).create().get();
+                    (ArtemisApplication) ApplicationProvider.getApplicationContext();
             assertNotNull(app);
+            app.onCreate();
 
             // Should now work without crashing
             ProfilesManager manager = ProfilesManager.getInstance();
