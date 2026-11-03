@@ -1732,6 +1732,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     protected void onResume() {
         super.onResume();
         streamVisible = true;
+        // Restoring a live session must also restore pointer/keyboard capture.
+        timerHandler.postDelayed(() -> {
+            if (streamVisible && connected && hasWindowFocus() && !isFinishing()) {
+                setInputGrabState(true);
+            }
+        }, 100);
         if (decoderRenderer != null && streamContainer != null && attemptedConnection) {
             Surface surface = streamContainer.getSurface();
             if (surface != null && surface.isValid() && (connected || connecting)) {
