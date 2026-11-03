@@ -75,3 +75,12 @@ background-lifecycle behavior. Device acceptance is required before release.
 Known limitation: The foreground service currently protects an Activity-owned
 session. It does not own and restore a transport across Android process death.
 The hardware/OS acceptance tests above remain mandatory.
+
+## Global bridge ownership and termination policy
+
+A cancelled or failed HTTP preflight does not own Moonlight-core and cannot
+interrupt another native connection. Bridge permits are released only by the
+owning instance, and permit acquisition polls cancellation rather than waiting
+forever after an obsolete attempt. Explicit user disconnect and graceful host
+termination are not retried. Unexpected transport loss is retried indefinitely
+while the Activity/session remains alive and Android permits execution.

@@ -3744,7 +3744,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void connectionTerminated(final int errorCode) {
         if (!sessionDesired || isFinishing() || isDestroyed()) return;
         if (sessionDesired && !isFinishing()
-                && errorCode != MoonBridge.ML_ERROR_PROTECTED_CONTENT) {
+                && errorCode != MoonBridge.ML_ERROR_PROTECTED_CONTENT
+                && errorCode != MoonBridge.ML_ERROR_GRACEFUL_TERMINATION) {
             runOnUiThread(() -> beginStreamRecovery("Transport ended: " + errorCode));
             return;
         }

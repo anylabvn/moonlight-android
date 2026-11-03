@@ -25,6 +25,7 @@ import java.util.Objects;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -107,6 +108,9 @@ public class NvConnection {
     public void stop() {
         // A failed HTTP preflight never owns a native bridge permit.
         attemptGeneration.incrementAndGet();
+        // MoonBridge is global. Do not interrupt another NvConnection instance
+        // when this one has only an outstanding HTTP preflight (no native bridge).
+        if (!bridgePermitHeld.get()) return;
         MoonBridge.interruptConnection();
         synchronized (MoonBridge.class) {
             if (bridgePermitHeld.getAndSet(false)) {
@@ -482,9 +486,20 @@ public class NvConnection {
                 // Acquire the connection semaphore to ensure we only have one
                 // connection going at once.
                 try {
-                    connectionAllowed.acquire();
+                    // A cancelled attempt must not block forever behind another
+                    // session's global bridge permit.
+                    boolean acquired = false;
+                    while (generation == attemptGeneration.get() && !acquired) {
+                        acquired = connectionAllowed.tryAcquire(250, TimeUnit.MILLISECONDS);
+                    }
+                    if (!acquired) return;
+                    if (generation != attemptGeneration.get()) {
+                        connectionAllowed.release();
+                        return;
+                    }
                 } catch (InterruptedException e) {
-                    context.connListener.displayMessage(e.getMessage());
+                    Thread.currentThread().interrupt();
+                    context.connListener.displayMessage("Connection attempt interrupted");
                     context.connListener.stageFailed(appName, 0, 0);
                     return;
                 }
