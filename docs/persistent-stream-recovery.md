@@ -84,3 +84,8 @@ owning instance, and permit acquisition polls cancellation rather than waiting
 forever after an obsolete attempt. Explicit user disconnect and graceful host
 termination are not retried. Unexpected transport loss is retried indefinitely
 while the Activity/session remains alive and Android permits execution.
+
+Lifecycle callbacks that close or activate a stream are validated again when
+the main-thread delivery executes, not only when the native callback first
+arrives. This prevents queued callbacks from a cancelled attempt from closing
+a newer stream while Android's UI thread is busy.

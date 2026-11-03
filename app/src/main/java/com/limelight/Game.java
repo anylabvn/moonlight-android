@@ -3660,7 +3660,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (sessionDesired && !conn.isPermanentStartFailure() && errorCode != 403
                 && errorCode != 470 && errorCode != 599
                 && (stage == null || !stage.toLowerCase(java.util.Locale.ROOT).contains("pair"))) {
-            runOnUiThread(() -> beginStreamRecovery("Stage failed: " + stage + " (" + errorCode + ")"));
+            final long failureGeneration = conn.getAttemptGeneration();
+            runOnUiThread(() -> {
+                if (failureGeneration == conn.getAttemptGeneration()) {
+                    beginStreamRecovery("Stage failed: " + stage + " (" + errorCode + ")");
+                }
+            });
             return false;
         }
         // Stop unattended retries for problems that require explicit user action.

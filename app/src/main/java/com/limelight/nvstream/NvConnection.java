@@ -12,6 +12,8 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.RouteInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -64,6 +66,10 @@ public class NvConnection {
 
     public boolean isPermanentStartFailure() {
         return permanentStartFailure;
+    }
+
+    public long getAttemptGeneration() {
+        return attemptGeneration.get();
     }
     private final boolean isMonkey;
     private final Context appContext;
@@ -417,8 +423,10 @@ public class NvConnection {
     public void start(final AudioRenderer audioRenderer, final VideoDecoderRenderer videoDecoderRenderer, final NvConnectionListener connectionListener)
     {
         final long generation = attemptGeneration.incrementAndGet();
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
         final NvConnectionListener guardedListener =
-                new GenerationGuardedConnectionListener(attemptGeneration, generation, connectionListener);
+                new GenerationGuardedConnectionListener(attemptGeneration, generation,
+                        connectionListener, command -> mainHandler.post(command));
         new Thread(new Runnable() {
             public void run() {
                 // HTTP preflights from separate attempts must never mutate the shared

@@ -1,6 +1,7 @@
 package com.limelight.nvstream;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.Executor;
 
 /**
  * Drops callbacks from obsolete Moonlight connection attempts.
@@ -13,13 +14,22 @@ public final class GenerationGuardedConnectionListener implements NvConnectionLi
     private final AtomicLong currentGeneration;
     private final long generation;
     private final NvConnectionListener delegate;
+    private final Executor lifecycleExecutor;
 
     public GenerationGuardedConnectionListener(AtomicLong currentGeneration,
                                                long generation,
                                                NvConnectionListener delegate) {
+        this(currentGeneration, generation, delegate, command -> command.run());
+    }
+
+    public GenerationGuardedConnectionListener(AtomicLong currentGeneration,
+                                               long generation,
+                                               NvConnectionListener delegate,
+                                               Executor lifecycleExecutor) {
         this.currentGeneration = currentGeneration;
         this.generation = generation;
         this.delegate = delegate;
+        this.lifecycleExecutor = lifecycleExecutor;
     }
 
     public boolean isCurrent() {
@@ -43,12 +53,16 @@ public final class GenerationGuardedConnectionListener implements NvConnectionLi
 
     @Override
     public void connectionStarted() {
-        if (isCurrent()) delegate.connectionStarted();
+        if (isCurrent()) lifecycleExecutor.execute(() -> {
+            if (isCurrent()) delegate.connectionStarted();
+        });
     }
 
     @Override
     public void connectionTerminated(int errorCode) {
-        if (isCurrent()) delegate.connectionTerminated(errorCode);
+        if (isCurrent()) lifecycleExecutor.execute(() -> {
+            if (isCurrent()) delegate.connectionTerminated(errorCode);
+        });
     }
 
     @Override

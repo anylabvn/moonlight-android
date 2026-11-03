@@ -3,6 +3,7 @@ package com.limelight.nvstream;
 import static org.junit.Assert.*;
 import org.junit.Test;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.ArrayDeque;
 
 public class GenerationGuardedConnectionListenerTest {
     private static final class Recorder implements NvConnectionListener {
@@ -56,5 +57,21 @@ public class GenerationGuardedConnectionListenerTest {
         generation.incrementAndGet();
         assertFalse(guarded.stageFailed("network", 1, -408));
         assertEquals(1, recorder.failed);
+    }
+
+    @Test
+    public void queuedLifecycleCallbackIsDroppedAfterCancellation() {
+        AtomicLong current = new AtomicLong(3);
+        Recorder recorder = new Recorder();
+        ArrayDeque<Runnable> pending = new ArrayDeque<>();
+        GenerationGuardedConnectionListener listener =
+                new GenerationGuardedConnectionListener(current, 3, recorder, pending::addLast);
+        listener.connectionStarted();
+        listener.connectionTerminated(-408);
+        assertEquals(2, pending.size());
+        current.incrementAndGet();
+        while (!pending.isEmpty()) pending.removeFirst().run();
+        assertEquals(0, recorder.started);
+        assertEquals(0, recorder.terminated);
     }
 }
