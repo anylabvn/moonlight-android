@@ -28,13 +28,13 @@ jobs:
         with:
           packages: 'platform-tools'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Install SDK platform and NDK
+      - name: Install SDK platform, build tools and NDK
         run: |
-          sdkmanager "platforms;android-36" "ndk;27.0.12077973"
-      - name: Full unit test suite (required)
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973"
+      - name: Full unit test suite (debug and release; required)
         run: |
           chmod +x gradlew
-          ./gradlew :app:testNonRoot_gameDebugUnitTest --no-daemon --stacktrace
+          ./gradlew :app:testNonRoot_gameDebugUnitTest :app:testNonRoot_gameReleaseUnitTest --no-daemon --stacktrace
       - name: Publish test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -44,11 +44,99 @@ jobs:
             app/build/reports/tests/
             app/build/test-results/
           if-no-files-found: warn
-      - name: Build non-root debug APK
-        run: ./gradlew :app:assembleNonRoot_gameDebug --no-daemon --stacktrace
-      - uses: actions/upload-artifact@v4
-        if: success()
+      - name: Build non-root release APK (unsigned; never debug-signed)
+        run: ./gradlew :app:assembleNonRoot_gameRelease --no-daemon --stacktrace
+      - name: Sign release with persistent secret or bootstrap a new key
+        id: release_sign
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.ANYLABVN_ARTEMIS_RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANYLABVN_ARTEMIS_RELEASE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          sign_dir="$RUNNER_TEMP/artemis-release-signing"
+          mkdir -p "$sign_dir" app/build/release-signing
+          trap 'rm -rf "$sign_dir"' EXIT
+          if [[ -n "$RELEASE_KEYSTORE_BASE64" && -n "$RELEASE_KEYSTORE_PASSWORD" ]]; then
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$sign_dir/anylabvn-artemis-release.p12"
+            export RELEASE_KEY_PASS="$RELEASE_KEYSTORE_PASSWORD"
+            echo 'bootstrap=false' >> "$GITHUB_OUTPUT"
+          elif [[ -z "$RELEASE_KEYSTORE_BASE64" && -z "$RELEASE_KEYSTORE_PASSWORD" ]]; then
+            export RELEASE_KEY_PASS="$(openssl rand -hex 32)"
+            keytool -genkeypair -noprompt \
+              -alias anylabvn-artemis -keyalg RSA -keysize 4096 \
+              -validity 10000 -storetype PKCS12 \
+              -keystore "$sign_dir/anylabvn-artemis-release.p12" \
+              -storepass "$RELEASE_KEY_PASS" -keypass "$RELEASE_KEY_PASS" \
+              -dname "CN=AnyLabVN Artemis Release, O=AnyLabVN"
+            echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Both release signing secrets must be set, or neither must be set"
+            exit 1
+          fi
+          keytool -list -keystore "$sign_dir/anylabvn-artemis-release.p12" \
+            -storetype PKCS12 -storepass "$RELEASE_KEY_PASS" -alias anylabvn-artemis >/dev/null
+
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          test -x "$build_tools/apksigner"
+          test -x "$build_tools/zipalign"
+          input_dir="app/build/outputs/apk/nonRoot_game/release"
+          output_dir="$input_dir/signed"
+          mkdir -p "$output_dir"
+          shopt -s nullglob
+          apks=("$input_dir"/*-unsigned.apk)
+          if [ "${#apks[@]}" -ne 4 ]; then
+            echo "::error::Expected four unsigned ABI release APKs, found ${#apks[@]}"
+            find app/build/outputs/apk -type f -name '*.apk' -print
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            base="$(basename "$apk" -unsigned.apk)"
+            aligned="$sign_dir/$base-aligned.apk"
+            signed="$output_dir/$base-signed.apk"
+            "$build_tools/zipalign" -P 16 -f 4 "$apk" "$aligned"
+            "$build_tools/apksigner" sign \
+              --ks "$sign_dir/anylabvn-artemis-release.p12" \
+              --ks-type PKCS12 --ks-key-alias anylabvn-artemis \
+              --ks-pass env:RELEASE_KEY_PASS --key-pass env:RELEASE_KEY_PASS \
+              --v1-signing-enabled true --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --out "$signed" "$aligned"
+            "$build_tools/apksigner" verify --verbose --print-certs \
+              --min-sdk-version 21 "$signed"
+            "$build_tools/zipalign" -P 16 -c 4 "$signed"
+            package_line="$("$build_tools/aapt" dump badging "$signed" | grep "^package: " || true)"
+            [[ "$package_line" == *"name='com.limelight.noir'"* ]] || { echo "::error::Unexpected package name: $package_line"; exit 1; }
+          done
+
+          # Only the very first key needs encrypted escrow. Never upload the
+          # raw PKCS12 or password to GitHub artifacts.
+          if [[ -z "$RELEASE_KEYSTORE_BASE64" ]]; then
+            printf '%s' "$RELEASE_KEY_PASS" > "$sign_dir/password.txt"
+            tar -C "$sign_dir" -czf "$sign_dir/credentials.tar.gz" \
+              anylabvn-artemis-release.p12 password.txt
+            openssl cms -encrypt -aes-256-cbc -binary \
+              -in "$sign_dir/credentials.tar.gz" \
+              -out app/build/release-signing/credentials.tar.gz.cms \
+              -outform DER .github/release-signing-recipient.crt
+            test -s app/build/release-signing/credentials.tar.gz.cms
+          fi
+          sha256sum "$output_dir"/*.apk
+
+      - name: Upload signed release APKs
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
         with:
-          name: artemis-stream-recovery-debug-apk
-          path: app/build/outputs/apk/**/*.apk
+          name: artemis-anylabvn-release-signed-apks
+          path: app/build/outputs/apk/nonRoot_game/release/signed/*.apk
+          if-no-files-found: error
+
+      - name: Upload encrypted signing-key recovery (one-time bootstrap)
+        if: github.event_name != 'pull_request' && steps.release_sign.outputs.bootstrap == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: artemis-release-key-encrypted-cms
+          path: app/build/release-signing/credentials.tar.gz.cms
           if-no-files-found: error
