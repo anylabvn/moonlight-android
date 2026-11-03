@@ -13,6 +13,7 @@ import android.os.IBinder;
 import android.os.Looper;
 
 import com.limelight.Game;
+import com.limelight.R;
 import com.limelight.LimeLog;
 
 /**
@@ -110,7 +111,7 @@ public final class StreamSessionService extends Service {
         Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
         Notification notification = builder.setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentTitle("Artemis remote desktop")
+                .setContentTitle(getString(R.string.app_label) + " remote desktop")
                 .setContentText(ACTION_RECONNECTING.equals(action) ? "Reconnecting to the host" : "Streaming session active")
                 .setContentIntent(open)
                 .setOngoing(true)

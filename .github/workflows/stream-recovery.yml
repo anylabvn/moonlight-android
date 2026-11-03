@@ -31,10 +31,10 @@ jobs:
       - name: Install SDK platform, build tools and NDK
         run: |
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973"
-      - name: Full unit test suite (debug and release; required)
+      - name: Full unit test suites (debug, release and parallel test release; required)
         run: |
           chmod +x gradlew
-          ./gradlew :app:testNonRoot_gameDebugUnitTest :app:testNonRoot_gameReleaseUnitTest --no-daemon --stacktrace
+          ./gradlew :app:testNonRoot_gameDebugUnitTest :app:testNonRoot_gameReleaseUnitTest :app:testNonRoot_gameReleaseTestUnitTest --no-daemon --stacktrace
       - name: Publish test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -44,8 +44,8 @@ jobs:
             app/build/reports/tests/
             app/build/test-results/
           if-no-files-found: warn
-      - name: Build non-root release APK (unsigned; never debug-signed)
-        run: ./gradlew :app:assembleNonRoot_gameRelease --no-daemon --stacktrace
+      - name: Build isolated non-root Release Test APK (unsigned; never debug-signed)
+        run: ./gradlew :app:assembleNonRoot_gameReleaseTest --no-daemon --stacktrace
       - name: Sign release with persistent secret or bootstrap a new key
         id: release_sign
         if: github.event_name != 'pull_request'
@@ -82,7 +82,7 @@ jobs:
           build_tools="$ANDROID_HOME/build-tools/36.0.0"
           test -x "$build_tools/apksigner"
           test -x "$build_tools/zipalign"
-          input_dir="app/build/outputs/apk/nonRoot_game/release"
+          input_dir="app/build/outputs/apk/nonRoot_game/releaseTest"
           output_dir="$input_dir/signed"
           mkdir -p "$output_dir"
           shopt -s nullglob
@@ -108,7 +108,11 @@ jobs:
               --min-sdk-version 21 "$signed"
             "$build_tools/zipalign" -P 16 -c 4 "$signed"
             package_line="$("$build_tools/aapt" dump badging "$signed" | grep "^package: " || true)"
-            [[ "$package_line" == *"name='com.limelight.noir'"* ]] || { echo "::error::Unexpected package name: $package_line"; exit 1; }
+            [[ "$package_line" == *"name='com.limelight.noir.anylabtest'"* ]] || { echo "::error::Unexpected package name: $package_line"; exit 1; }
+            # Each exported ContentProvider authority must be isolated too.
+            manifest="$("$build_tools/aapt" dump xmltree "$signed" AndroidManifest.xml)"
+            grep -Fq "poster.com.limelight.noir.anylabtest" <<< "$manifest"
+            grep -Fq "com.limelight.noir.anylabtest.fileprovider" <<< "$manifest"
           done
 
           # Only the very first key needs encrypted escrow. Never upload the
@@ -129,8 +133,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: artemis-anylabvn-release-signed-apks
-          path: app/build/outputs/apk/nonRoot_game/release/signed/*.apk
+          name: artemis-anylabvn-parallel-test-release-signed-apks
+          path: app/build/outputs/apk/nonRoot_game/releaseTest/signed/*.apk
           if-no-files-found: error
 
       - name: Upload encrypted signing-key recovery (one-time bootstrap)

@@ -142,6 +142,19 @@ android {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+
+        // Installable side by side with upstream Artemis Stable.
+        // This is a RELEASE-optimized test channel, not the debug build.
+        releaseTest {
+            initWith release
+            applicationIdSuffix ".noir.anylabtest"
+            versionNameSuffix "-anylabtest"
+            matchingFallbacks = ['release']
+
+            resValue "string", "app_label", "Artemis AnyLab Test"
+            resValue "string", "app_label_root", "Artemis AnyLab Test (Root)"
+            resValue "string", "app_label_game", "Artemis AnyLab Test"
+        }
     }
 
     externalNativeBuild {
