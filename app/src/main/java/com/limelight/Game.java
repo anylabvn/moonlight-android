@@ -40,6 +40,8 @@ import com.limelight.nvstream.jni.MoonBridge;
 import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.profiles.ProfilesManager;
+import com.limelight.stream.StreamRetryPolicy;
+import com.limelight.stream.StreamSessionService;
 import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
 import com.limelight.ui.StreamContainer;
@@ -76,6 +78,7 @@ import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -191,6 +194,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean autoEnterPip = false;
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
+    private boolean sessionDesired = true;
+    private boolean streamVisible = true;
+    private boolean recoveryStopping = false;
+    private Runnable pendingReconnect;
+    private ConnectivityManager.NetworkCallback recoveryNetworkCallback;
+    private final StreamRetryPolicy recoveryPolicy = new StreamRetryPolicy();
     private int suppressPipRefCount = 0;
     private String pcName;
     private String appName;
@@ -344,6 +353,23 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         instance = this;
         timerHandler = new Handler(Looper.getMainLooper());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            ConnectivityManager networkManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            recoveryNetworkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    timerHandler.post(() -> {
+                        if (pendingReconnect != null && !connected && !connecting && !recoveryStopping) {
+                            timerHandler.removeCallbacks(pendingReconnect);
+                            Runnable retry = pendingReconnect;
+                            pendingReconnect = null;
+                            retry.run();
+                        }
+                    });
+                }
+            };
+            networkManager.registerDefaultNetworkCallback(recoveryNetworkCallback);
+        }
 
         UiHelper.setLocale(this);
 
@@ -865,16 +891,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         //streamContainer.getHolder().addCallback(this);
 
         streamContainer.setOnSurfaceAvailable(() -> {
+            Surface surface = streamContainer.getSurface();
+            if (surface == null || !surface.isValid()) return;
             if (!attemptedConnection) {
-                LimeLog.info("Surface is available, starting connection...");
+                LimeLog.info("Surface available, starting managed session");
                 attemptedConnection = true;
-
-                // Der Decoder erhält die jeweils aktive Oberfläche vom Container
-                decoderRenderer.setRenderTarget(streamContainer.getSurface());
-
-                // Starten Sie die NvConnection
-                conn.start(new AndroidAudioRenderer(Game.this, prefConfig.playHostAudio),
+                connecting = true;
+                decoderRenderer.setRenderTarget(surface);
+                StreamSessionService.start(Game.this);
+                conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
                         decoderRenderer, Game.this);
+            } else if (streamVisible && (connected || connecting)) {
+                if (!decoderRenderer.restoreVideoSurface(surface)) {
+                    beginStreamRecovery("Could not restore display Surface");
+                }
             }
         });
 
@@ -1699,7 +1729,33 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        streamVisible = true;
+        if (decoderRenderer != null && streamContainer != null && attemptedConnection) {
+            Surface surface = streamContainer.getSurface();
+            if (surface != null && surface.isValid() && (connected || connecting)) {
+                if (!decoderRenderer.restoreVideoSurface(surface)) {
+                    beginStreamRecovery("Failed to reattach video Surface");
+                }
+            }
+            if (!connected && !connecting && !recoveryStopping && pendingReconnect == null && sessionDesired) {
+                scheduleStreamReconnect();
+            }
+        }
+    }
+
+    @Override
     protected void onDestroy() {
+        sessionDesired = false;
+        if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+        pendingReconnect = null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && recoveryNetworkCallback != null) {
+            ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE))
+                    .unregisterNetworkCallback(recoveryNetworkCallback);
+        }
+        if (conn != null && (connected || connecting)) stopConnection();
+        StreamSessionService.stop(this);
         super.onDestroy();
 
         instance = null;
@@ -1744,6 +1800,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     protected void onPause() {
+        // Never retain pointer/keyboard capture when another app has focus.
+        if (inputCaptureProvider != null) setInputGrabState(false);
         if (isFinishing()) {
             // Stop any further input device notifications before we lose focus (and pointer capture)
             if (controllerHandler != null) {
@@ -1760,6 +1818,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     @Override
     protected void onStop() {
         super.onStop();
+        streamVisible = false;
+        if (!isFinishing()) {
+            // Activity visibility is not session lifetime.
+            if (decoderRenderer != null && (connected || connecting)) {
+                if (!decoderRenderer.parkVideoSurface()) {
+                    beginStreamRecovery("Decoder cannot render without Activity Surface");
+                }
+            }
+            return;
+        }
+        sessionDesired = false;
+        if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+        pendingReconnect = null;
+        StreamSessionService.stop(this);
 
         SpinnerDialog.closeDialogs(this);
         Dialog.closeDialogs();
@@ -3451,6 +3523,78 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void stageComplete(String stage) {
     }
 
+    /**
+     * A transient failure owns exactly one stop -> retry transition.
+     * No UI Activity recreation is necessary while this Activity remains alive.
+     */
+    private void beginStreamRecovery(String reason) {
+        if (!sessionDesired || !attemptedConnection || isFinishing() || isDestroyed()
+                || recoveryStopping || pendingReconnect != null) return;
+
+        LimeLog.warning("Recovering streaming session: " + reason);
+        recoveryStopping = true;
+        connecting = false;
+        connected = false;
+        updatePipAutoEnter();
+        if (spinner != null) {
+            spinner.dismiss();
+            spinner = null;
+        }
+        if (inputCaptureProvider != null) setInputGrabState(false);
+        if (decoderRenderer != null) decoderRenderer.prepareForStop();
+        StreamSessionService.reconnecting(this);
+
+        new Thread(() -> {
+            try {
+                if (conn != null) conn.stop();
+            } catch (RuntimeException e) {
+                LimeLog.warning("Native session cleanup during recovery failed: " + e);
+            } finally {
+                runOnUiThread(() -> {
+                    recoveryStopping = false;
+                    if (sessionDesired && !isFinishing() && !isDestroyed()) {
+                        scheduleStreamReconnect();
+                    }
+                });
+            }
+        }, "Artemis - recovery cleanup").start();
+    }
+
+    private void scheduleStreamReconnect() {
+        if (!sessionDesired || !attemptedConnection || recoveryStopping
+                || connected || connecting || pendingReconnect != null
+                || isFinishing() || isDestroyed()) return;
+
+        long delay = recoveryPolicy.nextDelayMillis();
+        pendingReconnect = () -> {
+            pendingReconnect = null;
+            if (!sessionDesired || isFinishing() || isDestroyed()
+                    || recoveryStopping || connected || connecting) return;
+
+            Surface surface = streamContainer == null ? null : streamContainer.getSurface();
+            boolean targetReady;
+            if (streamVisible && surface != null && surface.isValid()) {
+                targetReady = decoderRenderer.restoreVideoSurface(surface);
+            } else {
+                targetReady = decoderRenderer.parkVideoSurface();
+            }
+            if (!targetReady || !decoderRenderer.hasUsableRenderTarget()) {
+                LimeLog.warning("Reconnect waiting for a usable decoder Surface");
+                scheduleStreamReconnect();
+                return;
+            }
+
+            LimeLog.info("Trying Artemis streaming session reconnect");
+            connecting = true;
+            displayedFailureDialog = false;
+            StreamSessionService.reconnecting(this);
+            conn.setRecoveryMode(true);
+            conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
+                    decoderRenderer, this);
+        };
+        timerHandler.postDelayed(pendingReconnect, delay);
+    }
+
     private void stopConnection() {
         if (connecting || connected) {
             connecting = connected = false;
@@ -3469,6 +3613,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             new Thread() {
                 public void run() {
                     conn.stop();
+                    if (!sessionDesired && decoderRenderer != null) {
+                        decoderRenderer.releaseParkedSurface();
+                    }
                     if (httpConn != null && quitOnStop) {
                         try {
                             sleep(1000);
@@ -3485,6 +3632,17 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean stageFailed(final String stage, final int portFlags, final int errorCode) {
+        if (!sessionDesired || isFinishing() || isDestroyed()) return false;
+        // Auth/ownership errors need user action; retry only transport-like failures.
+        if (sessionDesired && !conn.isPermanentStartFailure() && errorCode != 403
+                && errorCode != 470 && errorCode != 599
+                && (stage == null || !stage.toLowerCase(java.util.Locale.ROOT).contains("pair"))) {
+            runOnUiThread(() -> beginStreamRecovery("Stage failed: " + stage + " (" + errorCode + ")"));
+            return false;
+        }
+        // Stop unattended retries for problems that require explicit user action.
+        sessionDesired = false;
+        StreamSessionService.stop(this);
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
@@ -3561,6 +3719,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionTerminated(final int errorCode) {
+        if (!sessionDesired || isFinishing() || isDestroyed()) return;
+        if (sessionDesired && !isFinishing()
+                && errorCode != MoonBridge.ML_ERROR_PROTECTED_CONTENT) {
+            runOnUiThread(() -> beginStreamRecovery("Transport ended: " + errorCode));
+            return;
+        }
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
@@ -3678,6 +3842,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                if (!sessionDesired || !connecting || recoveryStopping) return;
+                recoveryPolicy.reset();
+                conn.setRecoveryMode(false);
+                if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+                pendingReconnect = null;
+                StreamSessionService.start(Game.this);
                 if (spinner != null) {
                     spinner.dismiss();
                     spinner = null;
@@ -3695,7 +3865,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 timerHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        setInputGrabState(true);
+                        if (hasWindowFocus() && streamVisible) setInputGrabState(true);
                     }
                 }, 500);
 
@@ -3845,16 +4015,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        if (!surfaceCreated) {
-            throw new IllegalStateException("Surface destroyed before creation!");
-        }
-
-        if (attemptedConnection) {
-            // Let the decoder know immediately that the surface is gone
-            decoderRenderer.prepareForStop();
-
-            if (connected) {
-                stopConnection();
+        surfaceCreated = false;
+        if (attemptedConnection && (connected || connecting) && decoderRenderer != null) {
+            if (!decoderRenderer.parkVideoSurface()) {
+                beginStreamRecovery("Video display Surface destroyed");
             }
         }
     }

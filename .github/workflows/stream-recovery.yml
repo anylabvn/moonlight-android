@@ -1,0 +1,42 @@
+name: Stream recovery Android build
+
+on:
+  push:
+    branches:
+      - feat/persistent-stream-auto-recovery
+  pull_request:
+    branches:
+      - moonlight-noir
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install SDK platform and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "ndk;27.0.12077973"
+      - name: Test and compile non-root Android app
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testNonRoot_gameDebugUnitTest :app:assembleNonRoot_gameDebug --stacktrace --no-daemon
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: artemis-stream-recovery-debug-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
