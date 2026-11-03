@@ -24,11 +24,12 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # Ubuntu GitHub runners already provide Android command-line tools.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK platform and NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-36" "ndk;27.0.12077973"
       - name: Test and compile non-root Android app
         run: |
