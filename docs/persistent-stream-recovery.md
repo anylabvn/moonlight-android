@@ -58,3 +58,20 @@ not guarantee continuous background execution on every OEM ROM.
 
 The CI build checks compile/test behavior, not real-device decoder or Android
 background-lifecycle behavior. Device acceptance is required before release.
+
+## Additional connection safety (PR hardening)
+
+- Each connection start receives a monotonically increasing generation. Callbacks
+  from older or cancelled attempts are discarded before reaching the Activity.
+- HTTP preflight and native connection setup from consecutive starts are
+  serialized to prevent overlapping changes to the connection context.
+- Android Recent Apps can return to the streaming Activity; the foreground
+  notification also opens that activity when the session is still alive.
+- Input capture and controller sensors are released or disabled when Game
+  loses foreground focus, then resumed when the user returns.
+- The final native stop/parked Surface cleanup also runs if the Activity is
+  destroyed during retry backoff.
+
+Known limitation: The foreground service currently protects an Activity-owned
+session. It does not own and restore a transport across Android process death.
+The hardware/OS acceptance tests above remain mandatory.

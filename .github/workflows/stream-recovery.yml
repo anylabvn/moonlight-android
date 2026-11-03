@@ -31,10 +31,10 @@ jobs:
       - name: Install SDK platform and NDK
         run: |
           sdkmanager "platforms;android-36" "ndk;27.0.12077973"
-      - name: Test streaming retry policy
+      - name: Test streaming recovery policies and callback generation
         run: |
           chmod +x gradlew
-          ./gradlew :app:testNonRoot_gameDebugUnitTest --tests 'com.limelight.stream.StreamRetryPolicyTest' --no-daemon
+          ./gradlew :app:testNonRoot_gameDebugUnitTest --tests 'com.limelight.stream.StreamRetryPolicyTest' --tests 'com.limelight.nvstream.GenerationGuardedConnectionListenerTest' --no-daemon
       - name: Build non-root debug APK
         run: ./gradlew :app:assembleNonRoot_gameDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4

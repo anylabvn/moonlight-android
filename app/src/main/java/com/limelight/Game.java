@@ -197,6 +197,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean sessionDesired = true;
     private boolean streamVisible = true;
     private boolean recoveryStopping = false;
+    private volatile boolean finalCleanupEnqueued;
     private Runnable pendingReconnect;
     private ConnectivityManager.NetworkCallback recoveryNetworkCallback;
     private final StreamRetryPolicy recoveryPolicy = new StreamRetryPolicy();
@@ -1732,6 +1733,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     protected void onResume() {
         super.onResume();
         streamVisible = true;
+        if (controllerHandler != null) controllerHandler.enableSensors();
         // Restoring a live session must also restore pointer/keyboard capture.
         timerHandler.postDelayed(() -> {
             if (streamVisible && connected && hasWindowFocus() && !isFinishing()) {
@@ -1761,6 +1763,19 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                     .unregisterNetworkCallback(recoveryNetworkCallback);
         }
         if (conn != null && (connected || connecting)) stopConnection();
+        if (conn != null && attemptedConnection && !finalCleanupEnqueued) {
+            // A connection may be in retry backoff when the Activity is destroyed.
+            // Cancel any outstanding HTTP/native work and free its parked Surface,
+            // even when neither connected nor connecting is true.
+            finalCleanupEnqueued = true;
+            new Thread(() -> {
+                try {
+                    conn.stop();
+                } finally {
+                    if (decoderRenderer != null) decoderRenderer.releaseParkedSurface();
+                }
+            }, "Artemis - final cleanup").start();
+        }
         StreamSessionService.stop(this);
         super.onDestroy();
 
@@ -1808,6 +1823,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     protected void onPause() {
         // Never retain pointer/keyboard capture when another app has focus.
         if (inputCaptureProvider != null) setInputGrabState(false);
+        if (controllerHandler != null) controllerHandler.disableSensors();
         if (isFinishing()) {
             // Stop any further input device notifications before we lose focus (and pointer capture)
             if (controllerHandler != null) {
@@ -3603,6 +3619,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     private void stopConnection() {
         if (connecting || connected) {
+            if (!sessionDesired) finalCleanupEnqueued = true;
             connecting = connected = false;
             updatePipAutoEnter();
 
@@ -3845,6 +3862,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionStarted() {
+        if (!sessionDesired || isFinishing() || isDestroyed()) return;
         runOnUiThread(new Runnable() {
             @Override
             public void run() {

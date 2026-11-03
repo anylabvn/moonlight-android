@@ -53,6 +53,7 @@ public class NvConnection {
     private static final Semaphore connectionAllowed = new Semaphore(1);
     private final AtomicBoolean bridgePermitHeld = new AtomicBoolean(false);
     private final AtomicLong attemptGeneration = new AtomicLong();
+    private final Object startupLock = new Object();
     private volatile boolean recoveryMode;
     private volatile boolean permanentStartFailure;
 
@@ -412,14 +413,18 @@ public class NvConnection {
     public void start(final AudioRenderer audioRenderer, final VideoDecoderRenderer videoDecoderRenderer, final NvConnectionListener connectionListener)
     {
         final long generation = attemptGeneration.incrementAndGet();
-        permanentStartFailure = false;
-        // New transport, new remote-input cryptographic key and IV identifier.
-        context.riKey = generateRiAesKey();
-        context.riKeyId = generateRiKeyId();
+        final NvConnectionListener guardedListener =
+                new GenerationGuardedConnectionListener(attemptGeneration, generation, connectionListener);
         new Thread(new Runnable() {
             public void run() {
+                // HTTP preflights from separate attempts must never mutate the shared
+                // ConnectionContext concurrently or launch/resume competing host sessions.
+                synchronized (startupLock) {
                 if (generation != attemptGeneration.get()) return;
-                context.connListener = connectionListener;
+                permanentStartFailure = false;
+                context.riKey = generateRiAesKey();
+                context.riKeyId = generateRiKeyId();
+                context.connListener = guardedListener;
                 context.videoCapabilities = videoDecoderRenderer.getCapabilities();
 
                 String appName = context.streamConfig.getApp().getAppName();
@@ -497,7 +502,7 @@ public class NvConnection {
                         if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
                         return;
                     }
-                    MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, connectionListener);
+                    MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, guardedListener);
                     int ret = MoonBridge.startConnection(context.serverAddress.address,
                             context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
                             context.serverCodecModeSupport,
@@ -519,8 +524,9 @@ public class NvConnection {
                         return;
                     }
                 }
+                }
             }
-        }).start();
+        }, "Artemis - connection preflight").start();
     }
 
     public void sendExecServerCmd(final int cmdId) {

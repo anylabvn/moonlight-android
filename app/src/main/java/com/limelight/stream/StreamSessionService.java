@@ -84,8 +84,21 @@ public final class StreamSessionService extends Service {
             return START_NOT_STICKY;
         }
 
-        Intent openIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
-        if (openIntent == null) openIntent = new Intent(this, Game.class);
+        // Return to the existing streaming Activity, not the computer list.
+        // The launch extras also preserve the host/app target if Android has
+        // to recreate Game in the same process.
+        Game activeGame = Game.instance;
+        Intent openIntent;
+        if (activeGame != null && !activeGame.isFinishing()) {
+            openIntent = new Intent(this, Game.class);
+            Intent originalIntent = activeGame.getIntent();
+            if (originalIntent != null && originalIntent.getExtras() != null) {
+                openIntent.putExtras(originalIntent.getExtras());
+            }
+        } else {
+            openIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            if (openIntent == null) openIntent = new Intent(this, Game.class);
+        }
         openIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent open = PendingIntent.getActivity(this, 0, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
