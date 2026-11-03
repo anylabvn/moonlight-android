@@ -28,6 +28,7 @@ public final class StreamSessionService extends Service {
     public static final String ACTION_STREAMING = "com.limelight.stream.STREAMING";
     private static final String CHANNEL_ID = "artemis_stream_session";
     private static final int NOTIFICATION_ID = 7801;
+    private static volatile boolean running;
 
     public static void start(Context context) {
         send(context, ACTION_STREAMING);
@@ -40,7 +41,9 @@ public final class StreamSessionService extends Service {
     private static void send(Context context, String action) {
         Intent intent = new Intent(context, StreamSessionService.class).setAction(action);
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (running) {
+                context.startService(intent);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent);
             } else {
                 context.startService(intent);
@@ -58,6 +61,7 @@ public final class StreamSessionService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        running = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID,
                     "Remote desktop session", NotificationManager.IMPORTANCE_LOW);
@@ -92,7 +96,7 @@ public final class StreamSessionService extends Service {
 
         Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-        Notification notification = builder.setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+        Notification notification = builder.setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle("Artemis remote desktop")
                 .setContentText(ACTION_RECONNECTING.equals(action) ? "Reconnecting to the host" : "Streaming session active")
                 .setContentIntent(open)
@@ -102,6 +106,12 @@ public final class StreamSessionService extends Service {
                 .build();
         startForeground(NOTIFICATION_ID, notification);
         return START_NOT_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        super.onDestroy();
     }
 
     @Override

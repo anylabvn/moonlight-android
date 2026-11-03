@@ -413,6 +413,9 @@ public class NvConnection {
     {
         final long generation = attemptGeneration.incrementAndGet();
         permanentStartFailure = false;
+        // New transport, new remote-input cryptographic key and IV identifier.
+        context.riKey = generateRiAesKey();
+        context.riKeyId = generateRiKeyId();
         new Thread(new Runnable() {
             public void run() {
                 if (generation != attemptGeneration.get()) return;
