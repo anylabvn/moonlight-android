@@ -178,3 +178,22 @@ to streaming without touching Connect, toggle Wi-Fi and restore Apollo, check
 accurate visible state/notification, verify no more than one live connection,
 and confirm the explicit Disconnect action releases its foreground wake lock.
 A CPU wake lock cannot guarantee that a vendor ROM will keep the process alive.
+
+## Thread-safe failure reporting
+
+Callbacks from Moonlight's HTTP and native startup threads must not update
+Android Views directly. Permanent startup failures now mark the session as
+no longer desired and **post all banner, watchdog cancellation and foreground
+service UI operations to the main thread**; network diagnostics remain off
+the UI thread. The former `stageFailed` path could return `true` after
+setting `sessionDesired=false`, making a lower-level retry inconsistent with
+the Activity's recovery state; this path has been removed.
+
+Unexpected preflight exceptions are reported through the generation-guarded
+failure callback instead of silently abandoning the worker thread. Native
+interrupt exceptions do not skip cleanup of the bridge and global permit.
+
+These are source-level reliability corrections verified by CI tests and build,
+not device-confirmed reconnection. A physical Android/Apollo test still needs
+to establish that connection survives backgrounding and returns to usable
+audio/video/input after Wi-Fi and host failures.

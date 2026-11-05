@@ -117,7 +117,12 @@ public class NvConnection {
         // MoonBridge is global. Do not interrupt another NvConnection instance
         // when this one has only an outstanding HTTP preflight (no native bridge).
         if (!bridgePermitHeld.get()) return;
-        MoonBridge.interruptConnection();
+        try {
+            MoonBridge.interruptConnection();
+        } catch (RuntimeException e) {
+            // Still release our bridge ownership and semaphore below.
+            LimeLog.warning("Native interrupt failed during cleanup: " + e);
+        }
         synchronized (MoonBridge.class) {
             if (bridgePermitHeld.getAndSet(false)) {
                 try {
@@ -432,6 +437,7 @@ public class NvConnection {
                         connectionListener, command -> mainHandler.post(command));
         new Thread(new Runnable() {
             public void run() {
+                try {
                 // HTTP preflights from separate attempts must never mutate the shared
                 // ConnectionContext concurrently or launch/resume competing host sessions.
                 synchronized (startupLock) {
@@ -558,6 +564,12 @@ public class NvConnection {
                         guardedListener.stageFailed("Native stream startup exception", 0, -408);
                     }
                 }
+                }
+                } catch (RuntimeException e) {
+                    // Unexpected HTTP/parser/startup runtime faults must not
+                    // leave Game.connecting stuck until its 45s watchdog.
+                    LimeLog.warning("Connection preflight exception: " + e);
+                    guardedListener.stageFailed("Connection preflight exception", 0, -408);
                 }
             }
         }, "Artemis - connection preflight").start();

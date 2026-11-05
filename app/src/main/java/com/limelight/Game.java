@@ -3924,20 +3924,22 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             });
             return false;
         }
-        // Stop unattended retries for problems that require explicit user action.
+        // Permanent failure: the native/HTTP thread must not touch Android
+        // views, handlers, or the foreground service directly.
+        // In particular, never return "retry in this HTTP attempt" *after*
+        // setting sessionDesired=false, which disables all future recovery.
         sessionDesired = false;
-        cancelConnectionStartTimeout();
-        timerHandler.removeCallbacks(streamHealthCheck);
-        showConnectionState(getString(R.string.stream_recovery_needs_attention));
-        StreamSessionService.stop(this);
-        // Perform a connection test if the failure could be due to a blocked port
-        // This does network I/O, so don't do it on the main thread.
-        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
+        runOnUiThread(() -> {
+            cancelConnectionStartTimeout();
+            timerHandler.removeCallbacks(streamHealthCheck);
+            showConnectionState(getString(R.string.stream_recovery_needs_attention));
+            StreamSessionService.stop(Game.this);
+        });
 
-        if (errorCode == 0 && portFlags != 0 && (portTestResult == MoonBridge.ML_TEST_RESULT_INCONCLUSIVE || portTestResult == 0)) {
-            spinner.setMessage(getResources().getString(R.string.unlocking_or_starting));
-            return true;
-        }
+        // Connectivity diagnosis does I/O and must remain off the UI thread.
+        final int portTestResult = portFlags == 0
+                ? MoonBridge.ML_TEST_RESULT_INCONCLUSIVE
+                : MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
 
         runOnUiThread(new Runnable() {
             @Override
@@ -3953,7 +3955,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                     // If video initialization failed and the surface is still valid, display extra information for the user
                     Surface currentSurface = streamContainer.getSurface();
-                    if (stage.contains("video") && currentSurface != null && currentSurface.isValid()) {
+                    if (stage != null && stage.contains("video") &&
+                            currentSurface != null && currentSurface.isValid()) {
                         Toast.makeText(Game.this, getResources().getText(R.string.video_decoder_init_failed), Toast.LENGTH_LONG).show();
                     }
 
