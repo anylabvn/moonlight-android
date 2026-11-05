@@ -292,3 +292,25 @@ background network access.
 5. Ensure remote/manual disconnection, pairing/ownership denials,
    and user-initiated quit remain non-retryable.
 6. Verify the Test package remains independently installable beside Stable.
+
+### Reusing the Android decoder safely
+
+The original automatic reconnect reused `MediaCodecDecoderRenderer` after
+native cleanup, but `setup()` only reset `stopping`, the last-video timestamp,
+and the video dimensions. Several values belong to the old video session:
+NALU parameter sets (VPS/SPS/PPS), codec input indexes and buffers,
+queued output indexes, frame-number continuity, timestamp/pacing state,
+per-session statistics, and codec-recovery attempts. The new
+`resetStreamDecoderState()` clears these **before each new setup**.
+
+The selected Android rendering Surface is deliberately preserved: the
+reconnect gate chooses a usable visible or parked Surface *before* native
+`startConnection`, and the renderer must not lose that target during setup.
+The old worker threads and MediaCodec instance must already be stopped
+and cleaned by the native disconnect path; changing these while an old
+renderer thread is still active would be unsafe.
+
+This addresses state leakage that would not occur when manually opening
+a fresh Game Activity, but it still requires video/audio/input validation
+on the actual device. Decoder-compatibility bugs that cannot survive
+`MediaCodec.stop()/release()` may need a separate fallback path.

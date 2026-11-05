@@ -862,10 +862,51 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return 0;
     }
 
+    /**
+     * Reset per-stream codec state before starting a new native transport.
+     * A reconnect reuses this renderer object, unlike opening a new Game
+     * Activity. Old codec indexes, CSD, frame numbers and pacing state must
+     * never leak into the replacement stream.
+     *
+     * Called only after the prior native bridge finished stop()/cleanup().
+     * Do not reset renderTarget: it points to the new visible/parked Surface
+     * already selected by the reconnect coordinator.
+     */
+    private void resetStreamDecoderState() {
+        nextInputBufferIndex = -1;
+        nextInputBuffer = null;
+        legacyInputBuffers = null;
+        outputBufferQueue.clear();
+        vpsBuffers.clear();
+        spsBuffers.clear();
+        ppsBuffers.clear();
+        submittedCsd = false;
+        currentHdrMetadata = null;
+        savedSps = null;
+        needsBaselineSpsHack = false;
+
+        lastFrameNumber = 0;
+        lastTimestampUs = 0L;
+        lastRenderedFrameTimeNanos = 0L;
+        lastVideoFrameElapsedRealtime = 0L;
+        lastNetDataNum = 0L;
+        numSpsIn = numPpsIn = numVpsIn = 0;
+        numFramesIn = numFramesOut = 0;
+
+        activeWindowVideoStats = new VideoStats();
+        lastWindowVideoStats = new VideoStats();
+        globalVideoStats = new VideoStats();
+        codecRecoveryType.set(CR_RECOVERY_TYPE_NONE);
+        codecRecoveryThreadQuiescedFlags = 0;
+        codecRecoveryAttempts = 0;
+        initialException = null;
+        initialExceptionTimestamp = 0L;
+    }
+
     @Override
     public int setup(int format, int width, int height, int redrawRate) {
+        resetStreamDecoderState();
         stopping = false;
-        lastVideoFrameElapsedRealtime = 0L;
         this.targetFps = (redrawRate > 0 ? redrawRate : 60);
         this.initialWidth = invertResolution ? height : width;
         this.initialHeight = invertResolution ? width : height;
