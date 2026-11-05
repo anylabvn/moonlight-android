@@ -48,6 +48,7 @@ import com.limelight.ui.GameGestures;
 import com.limelight.ui.StreamContainer;
 import com.limelight.utils.Dialog;
 import com.limelight.utils.ExternalDisplayControlActivity;
+import com.limelight.utils.KeyMapper;
 import com.limelight.utils.MouseModeOption;
 import com.limelight.utils.PanZoomHandler;
 import com.limelight.utils.PerformanceDataTracker;
@@ -218,6 +219,37 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean waitingForAllModifiersUp = false;
     private int specialKeyCode = KeyEvent.KEYCODE_UNKNOWN;
     private StreamContainer streamContainer;
+
+    // KernelSU Nabu relay identity. The relay exposes harmless Android F-key codes
+    // but retains the original Linux scan code for Ctrl/Alt/Meta/Escape/etc.
+    private static final int NABU_REMOTE_HOTKEY_VENDOR_ID = 0x4e42;
+    private static final int NABU_REMOTE_HOTKEY_PRODUCT_ID = 0x4852;
+    private final Set<Integer> nabuRemoteHotkeyDeviceIds = new HashSet<>();
+    private final Set<Integer> nabuRemoteHotkeyPressedScancodes = new HashSet<>();
+    private final InputManager.InputDeviceListener nabuRemoteHotkeyDeviceListener =
+            new InputManager.InputDeviceListener() {
+                @Override
+                public void onInputDeviceAdded(int deviceId) {
+                    updateNabuRemoteHotkeyDevice(deviceId);
+                }
+
+                @Override
+                public void onInputDeviceRemoved(int deviceId) {
+                    if (nabuRemoteHotkeyDeviceIds.remove(deviceId)) {
+                        releaseNabuRemoteHotkeys();
+                    }
+                }
+
+                @Override
+                public void onInputDeviceChanged(int deviceId) {
+                    boolean wasRelay = nabuRemoteHotkeyDeviceIds.contains(deviceId);
+                    updateNabuRemoteHotkeyDevice(deviceId);
+                    if (wasRelay && !nabuRemoteHotkeyDeviceIds.contains(deviceId)) {
+                        releaseNabuRemoteHotkeys();
+                    }
+                }
+            };
+
     private long synthTouchDownTime = 0;
 
     private boolean pendingDrag = false;
@@ -839,6 +871,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         inputManager.registerInputDeviceListener(keyboardTranslator, null);
+        inputManager.registerInputDeviceListener(nabuRemoteHotkeyDeviceListener, null);
+        for (int deviceId : InputDevice.getDeviceIds()) {
+            updateNabuRemoteHotkeyDevice(deviceId);
+        }
 
         // Initialize trackpad contexts
         for (int i = 0; i < trackpadContextMap.length; i++) {
@@ -1435,6 +1471,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
 
+        if (!hasFocus) {
+            // The relay may disappear or release keys while Android no longer
+            // delivers events to this Activity. Release host-side VK state now.
+            releaseNabuRemoteHotkeys();
+        }
+
         // We can't guarantee the state of modifiers keys which may have
         // lifted while focus was not on us. Clear the modifier state.
         this.modifierFlags = 0;
@@ -1791,6 +1833,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (keyboardTranslator != null) {
             InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
             inputManager.unregisterInputDeviceListener(keyboardTranslator);
+            inputManager.unregisterInputDeviceListener(nabuRemoteHotkeyDeviceListener);
         }
 
         if (lowLatencyWifiLock != null) {
@@ -1957,6 +2000,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     private void setInputGrabState(boolean grab) {
+        if (!grab) {
+            releaseNabuRemoteHotkeys();
+        }
+
         // Grab/ungrab the mouse cursor
         if (grab) {
             inputCaptureProvider.enableCapture();
@@ -2131,6 +2178,75 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         return (byte) modifierFlags;
     }
 
+    private boolean isNabuRemoteHotkeyRelay(InputDevice device) {
+        return device != null &&
+                device.getVendorId() == NABU_REMOTE_HOTKEY_VENDOR_ID &&
+                device.getProductId() == NABU_REMOTE_HOTKEY_PRODUCT_ID;
+    }
+
+    private void updateNabuRemoteHotkeyDevice(int deviceId) {
+        InputDevice device = InputDevice.getDevice(deviceId);
+        if (isNabuRemoteHotkeyRelay(device)) {
+            nabuRemoteHotkeyDeviceIds.add(deviceId);
+        } else {
+            nabuRemoteHotkeyDeviceIds.remove(deviceId);
+        }
+    }
+
+    /**
+     * Handle the dedicated KernelSU hotkey relay before Android-keycode
+     * translation. Its Android key codes are intentionally harmless surrogates;
+     * the Linux scan code is the authoritative identity sent to the host.
+     */
+    private boolean handleNabuRemoteHotkeyRelay(KeyEvent event, boolean down) {
+        if (!isNabuRemoteHotkeyRelay(event.getDevice())) {
+            return false;
+        }
+
+        final int scanCode = event.getScanCode();
+        final short translated = keyboardTranslator != null
+                ? keyboardTranslator.translateRawScancode(scanCode) : 0;
+
+        // Always consume events from this trusted relay so surrogate F13-F20
+        // keycodes can never leak through the ordinary Android translation path.
+        if (translated == 0 || conn == null || !grabbedInput) {
+            if (!down) {
+                nabuRemoteHotkeyPressedScancodes.remove(scanCode);
+            }
+            return true;
+        }
+
+        if (down) {
+            if (event.getRepeatCount() > 0 || !nabuRemoteHotkeyPressedScancodes.add(scanCode)) {
+                return true;
+            }
+        } else if (!nabuRemoteHotkeyPressedScancodes.remove(scanCode)) {
+            return true;
+        }
+
+        conn.sendKeyboardInput(translated,
+                down ? KeyboardPacket.KEY_DOWN : KeyboardPacket.KEY_UP,
+                (byte) 0, MoonBridge.SS_KBE_FLAG_NON_NORMALIZED);
+        return true;
+    }
+
+    private void releaseNabuRemoteHotkeys() {
+        if (nabuRemoteHotkeyPressedScancodes.isEmpty()) {
+            return;
+        }
+
+        if (conn != null && keyboardTranslator != null) {
+            for (Integer scanCode : new HashSet<>(nabuRemoteHotkeyPressedScancodes)) {
+                short translated = keyboardTranslator.translateRawScancode(scanCode);
+                if (translated != 0) {
+                    conn.sendKeyboardInput(translated, KeyboardPacket.KEY_UP,
+                            (byte) 0, MoonBridge.SS_KBE_FLAG_NON_NORMALIZED);
+                }
+            }
+        }
+        nabuRemoteHotkeyPressedScancodes.clear();
+    }
+
     /**
      * Keep keyboard Escape from falling back to Android Back navigation.
      *
@@ -2166,6 +2282,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyDown(KeyEvent event) {
+        if (handleNabuRemoteHotkeyRelay(event, true)) {
+            return true;
+        }
         if (handleStreamEscapeKey(event, true)) {
             return true;
         }
@@ -2261,6 +2380,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyUp(KeyEvent event) {
+        if (handleNabuRemoteHotkeyRelay(event, false)) {
+            return true;
+        }
         if (handleStreamEscapeKey(event, false)) {
             return true;
         }
