@@ -212,3 +212,83 @@ sessions (without video) are confirmed from the transport event directly.
 Use an Apollo session that can show changing frames when validating the
 media-level success indicator; a synthetic native connection test alone does
 not cover full video/audio/input restoration.
+
+## Deterministic reconnect rounds — RustDesk-informed hardening
+
+The key transition is **disconnect the old transport → verify cleanup →
+start a fresh transport connection**. This does *not* quit the application
+on Apollo; the stream reconnect resumes the same host session when allowed.
+Users who explicitly disconnect do not enter retry.
+
+Implementation: `StreamReconnectCycle` assigns every recovery an incrementing
+round number and enforces this sequence:
+
+```text
+ACTIVE/CONNECTING
+   |
+   | transient network, timeout, decoder or transport failure
+   v
+STOPPING       -- conn.stop() blocking on recovery worker thread
+   |
+   | native stop/cleanup completed; previous MoonBridge permit released
+   v
+WAITING        -- exponential transport backoff
+   |
+   | usable decoder Surface available + round still current
+   v
+CONNECTING     -- conn.start() of the replacement transport
+   |
+   | native handshake and fresh media (for video sessions)
+   v
+ACTIVE
+```
+
+An old cleanup completion cannot move a newer round forward. The screen
+resume path now re-enters via `beginStreamRecovery()` (stop first) rather than
+directly scheduling another `conn.start()`. Waiting for a local decoder
+Surface is retried at a short fixed interval and does not count as another
+host/network failure; synchronous startup errors re-enter the stop path.
+On Android resume, the video health check runs promptly rather than waiting
+for the next periodic watchdog tick.
+
+If native `conn.stop()` itself throws, the old session may still own
+resources. The client surfaces a user-action error and does **not** risk
+starting a second native session. A retry does not call the Apollo
+`quitApp()` endpoint; it must never kill an unrelated desktop session.
+
+### External implementation evidence
+
+- RustDesk PR [#15143](https://github.com/rustdesk/rustdesk/pull/15143)
+  (merged June 1, 2026): an Android reconnect wedge was traced to old Rust
+  sessions never being closed when Flutter dispose suspended. The fix
+  initiated `sessionClose` *before* awaiting UI cleanup.
+- RustDesk's [`ui_session_interface.rs`](https://github.com/rustdesk/rustdesk/blob/master/src/ui_session_interface.rs)
+  keeps a `connection_round_state`, closes the previous active session,
+  and starts the next io loop with a fresh round ID.
+- RustDesk PR [#16662](https://github.com/rustdesk/rustdesk/pull/16662)
+  (open at review time, **not a merged behavior guarantee**) observes
+  background network restrictions on Android; it proposes a single
+  reconnect on foreground resume while preserving deliberate remote
+  disconnect choices.
+- RustDesk PR [#15290](https://github.com/rustdesk/rustdesk/pull/15290)
+  (merged June 17, 2026) models remote restart as a bounded reconnect
+  state with explicit user feedback.
+
+These are **design analogies**. Artemis speaks Moonlight/Sunshine/Apollo,
+not RustDesk's relay protocol. A successful local Java test of the
+transaction does not demonstrate Apollo server recovery or Android OEM
+background network access.
+
+### Acceptance checks
+
+1. For every automatic retry, verify `conn.stop()` returns and old native
+   connection ownership is released *before* another `conn.start()`.
+2. Reproduce background/foreground while disconnect is in progress;
+   a stale stop must not create a second connection.
+3. Restart Apollo and toggle Wi-Fi. Confirm no repeated `Connecting…` trap,
+   remote video/audio/input are usable, and the status reflects actual media.
+4. Keep the tablet locked, unlock it, and confirm a stranded session is
+   detected on resume; do not disrupt a healthy session.
+5. Ensure remote/manual disconnection, pairing/ownership denials,
+   and user-initiated quit remain non-retryable.
+6. Verify the Test package remains independently installable beside Stable.

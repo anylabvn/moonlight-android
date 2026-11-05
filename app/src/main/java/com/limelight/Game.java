@@ -43,6 +43,7 @@ import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.profiles.ProfilesManager;
 import com.limelight.stream.StreamRetryPolicy;
 import com.limelight.stream.StreamConnectionHealth;
+import com.limelight.stream.StreamReconnectCycle;
 import com.limelight.stream.StreamSessionService;
 import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
@@ -205,6 +206,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private Runnable pendingReconnect;
     private ConnectivityManager.NetworkCallback recoveryNetworkCallback;
     private final StreamRetryPolicy recoveryPolicy = new StreamRetryPolicy();
+    private final StreamReconnectCycle reconnectCycle = new StreamReconnectCycle();
     private static final long CONNECTION_START_TIMEOUT_MS = 45_000L;
     private static final long VIDEO_STALL_TIMEOUT_MS = 25_000L;
     private static final long STREAM_HEALTH_INTERVAL_MS = 5_000L;
@@ -1831,6 +1833,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 setInputGrabState(true);
             }
         }, 100);
+        if (connected && !recoveryStopping) {
+            // If Android paused our timers while the application was
+            // backgrounded, check video health immediately on resume.
+            timerHandler.removeCallbacks(streamHealthCheck);
+            timerHandler.post(streamHealthCheck);
+        }
         if (decoderRenderer != null && streamContainer != null && attemptedConnection) {
             Surface surface = streamContainer.getSurface();
             if (surface != null && surface.isValid() && (connected || connecting)) {
@@ -1838,8 +1846,15 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                     beginStreamRecovery("Failed to reattach video Surface");
                 }
             }
-            if (!connected && !connecting && !recoveryStopping && pendingReconnect == null && sessionDesired) {
-                scheduleStreamReconnect();
+            if (!connected && !connecting && !recoveryStopping &&
+                    pendingReconnect == null && sessionDesired) {
+                if (reconnectCycle.getPhase() == StreamReconnectCycle.Phase.WAITING) {
+                    // Cleanup already finished; do not perform it a second time.
+                    scheduleStreamReconnect();
+                } else {
+                    // Never bypass disconnect when recovering after resume.
+                    beginStreamRecovery("Resume found an inactive stream");
+                }
             }
         }
     }
@@ -1847,6 +1862,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     @Override
     protected void onDestroy() {
         sessionDesired = false;
+        reconnectCycle.close();
         if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
         pendingReconnect = null;
         cancelConnectionStartTimeout();
@@ -3810,7 +3826,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (!sessionDesired || !attemptedConnection || isFinishing() || isDestroyed()
                 || recoveryStopping || pendingReconnect != null) return;
 
-        LimeLog.warning("Recovering streaming session: " + reason);
+        // A recovery round cannot start until its predecessor has been
+        // disconnected and the native connection permit released.
+        final long round = reconnectCycle.beginDisconnect();
+        if (round < 0) return;
+        LimeLog.warning("Recovering streaming session [" + round + "]: " + reason);
         if (connected) {
             recoveryPolicy.onStreamEnded(lastSuccessfulConnectionElapsedMs,
                     SystemClock.elapsedRealtime());
@@ -3834,28 +3854,50 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         StreamSessionService.reconnecting(this);
 
         new Thread(() -> {
+            RuntimeException cleanupError = null;
             try {
+                // Blocking stop: no new session until native bridge, codec
+                // and global MoonBridge permit are released.
                 if (conn != null) conn.stop();
             } catch (RuntimeException e) {
-                LimeLog.warning("Native session cleanup during recovery failed: " + e);
-            } finally {
-                runOnUiThread(() -> {
-                    recoveryStopping = false;
-                    if (sessionDesired && !isFinishing() && !isDestroyed()) {
-                        scheduleStreamReconnect();
-                    }
-                });
+                cleanupError = e;
+                LimeLog.warning("Unable to fully disconnect old stream: " + e);
             }
+            final RuntimeException error = cleanupError;
+            runOnUiThread(() -> {
+                // An obsolete stop completion cannot restart a newer session.
+                if (!reconnectCycle.disconnected(round)) return;
+                recoveryStopping = false;
+                if (!sessionDesired || isFinishing() || isDestroyed()) return;
+                if (error != null) {
+                    // We cannot safely claim a fresh connection while the
+                    // predecessor may still be alive inside MoonBridge.
+                    sessionDesired = false;
+                    reconnectCycle.close();
+                    showConnectionState(getString(R.string.stream_recovery_cleanup_failed));
+                    StreamSessionService.stop(Game.this);
+                    return;
+                }
+                scheduleStreamReconnect();
+            });
         }, "Artemis - recovery cleanup").start();
     }
 
     private void scheduleStreamReconnect() {
+        scheduleStreamReconnect(true);
+    }
+
+    private void scheduleStreamReconnect(boolean countTransportFailure) {
         if (!sessionDesired || !attemptedConnection || recoveryStopping
                 || connected || connecting || pendingReconnect != null
+                || reconnectCycle.getPhase() != StreamReconnectCycle.Phase.WAITING
                 || isFinishing() || isDestroyed()) return;
 
-        long delay = recoveryPolicy.nextDelayMillis();
-        final int attemptNumber = recoveryPolicy.getFailureCount();
+        // Waiting for a Surface is not a transport failure.
+        long delay = countTransportFailure
+                ? recoveryPolicy.nextDelayMillis() : 1000L;
+        final int attemptNumber = Math.max(1, recoveryPolicy.getFailureCount());
+        final long round = reconnectCycle.currentRound();
         final String waitMessage = getString(R.string.stream_recovery_waiting,
                 attemptNumber, Math.max(1L, (delay + 999L) / 1000L));
         showConnectionState(getString(R.string.stream_connection_lost) + "\n" + waitMessage);
@@ -3863,7 +3905,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         pendingReconnect = () -> {
             pendingReconnect = null;
             if (!sessionDesired || isFinishing() || isDestroyed()
-                    || recoveryStopping || connected || connecting) return;
+                    || recoveryStopping || connected || connecting ||
+                    !reconnectCycle.isWaiting(round)) return;
 
             Surface surface = streamContainer == null ? null : streamContainer.getSurface();
             boolean targetReady;
@@ -3874,20 +3917,27 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             }
             if (!targetReady || !decoderRenderer.hasUsableRenderTarget()) {
                 LimeLog.warning("Reconnect waiting for a usable decoder Surface");
-                scheduleStreamReconnect();
+                scheduleStreamReconnect(false);
                 return;
             }
 
-            LimeLog.info("Trying Artemis streaming session reconnect, attempt " + attemptNumber);
+            if (!reconnectCycle.beginConnect(round)) return;
+            LimeLog.info("Trying Artemis streaming session reconnect, round " +
+                    round + ", attempt " + attemptNumber);
             connecting = true;
             displayedFailureDialog = false;
             final String progress = getString(R.string.stream_recovery_attempt, attemptNumber);
             showConnectionState(progress);
             StreamSessionService.reconnecting(this, progress);
             conn.setRecoveryMode(true);
-            conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
-                    decoderRenderer, this);
-            armConnectionStartTimeout();
+            try {
+                conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
+                        decoderRenderer, this);
+                armConnectionStartTimeout();
+            } catch (RuntimeException e) {
+                LimeLog.warning("Reconnect start failed synchronously: " + e);
+                beginStreamRecovery("Unable to start native session");
+            }
         };
         timerHandler.postDelayed(pendingReconnect, delay);
     }
@@ -3943,11 +3993,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             });
             return false;
         }
-        // Permanent failure: the native/HTTP thread must not touch Android
-        // views, handlers, or the foreground service directly.
-        // In particular, never return "retry in this HTTP attempt" *after*
-        // setting sessionDesired=false, which disables all future recovery.
+        // Permanent host/pairing error: never override a server-side
+        // decision by blindly reconnecting.
         sessionDesired = false;
+        reconnectCycle.close();
         runOnUiThread(() -> {
             cancelConnectionStartTimeout();
             timerHandler.removeCallbacks(streamHealthCheck);
@@ -4167,6 +4216,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                 connected = true;
                 connecting = false;
+                reconnectCycle.connected();
                 lastSuccessfulConnectionElapsedMs = SystemClock.elapsedRealtime();
                 timerHandler.removeCallbacks(streamHealthCheck);
                 timerHandler.postDelayed(streamHealthCheck, STREAM_HEALTH_INTERVAL_MS);
