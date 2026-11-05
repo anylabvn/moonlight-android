@@ -314,3 +314,27 @@ This addresses state leakage that would not occur when manually opening
 a fresh Game Activity, but it still requires video/audio/input validation
 on the actual device. Decoder-compatibility bugs that cannot survive
 `MediaCodec.stop()/release()` may need a separate fallback path.
+
+### HTTP launch/resume must not trap the next reconnect round
+
+`NvConnection.start()` performs its HTTP preflight under a per-connection
+`startupLock`. In the prior implementation, `NvHTTP.launchApp()` called
+the Apollo/Moonlight `launch` and `resume` endpoints through an OkHttp
+client with an **unlimited read timeout**. If the host stopped responding
+mid-request (for example, during a PC reboot), the old preflight thread
+could hold `startupLock` indefinitely. A 45-second UI watchdog could
+invalidate that attempt but could not release the blocked Java monitor.
+Later retry workers would remain waiting for it, never reaching native
+`startConnection`.
+
+The session-establishment HTTP client now has a 15-second read timeout
+and a 25-second whole-call timeout. A blocked request becomes a retriable
+`IOException`, the worker exits and releases the startup lock, and the
+round coordinator can perform another stop-before-start cycle. Other
+host HTTP workflows (including pairing/user approval and quit) retain
+their existing timeout contracts.
+
+The bounded timeout is a tradeoff: a host taking unusually long to
+launch/resume an app may require another retry, instead of holding the
+entire client indefinitely. Device acceptance should include Apollo
+restarting while the `resume` request is in flight.
