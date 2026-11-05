@@ -89,3 +89,53 @@ Lifecycle callbacks that close or activate a stream are validated again when
 the main-thread delivery executes, not only when the native callback first
 arrives. This prevents queued callbacks from a cancelled attempt from closing
 a newer stream while Android's UI thread is busy.
+
+## Reliability and visibility hardening
+
+### Failure detection
+
+- Native connection startup failure (nonzero return code) now reports
+  `stageFailed` to the Java recovery owner; it must not leave `connecting`
+  true indefinitely.
+- A 45-second connection-attempt watchdog recovers from preflight/native
+  startup hangs that do not produce an error callback. The watchdog is
+  generation-scoped, cancelled on success/cleanup, and applies to foreground
+  and background connection attempts.
+- Android's default network-loss callback triggers transport recovery. An
+  available network can accelerate a scheduled retry. Merely reporting poor
+  network quality does *not* automatically destroy a working connection.
+- The video decoder records the last received frame against a monotonic clock.
+  Once streaming, a 25-second frame stall triggers recovery even if no native
+  error callback arrives. The monitor does not trigger until a real frame has
+  arrived, avoiding false positives for input-only sessions.
+- Recovery still serializes stop/retry against the global Moonlight bridge and
+  prevents stale native callbacks from affecting a subsequent attempt.
+
+### User-visible connection state
+
+The Game Activity contains a persistent high-contrast connection banner
+independent of optional packet-loss warnings. It displays the lost-connection
+state, retries with attempt count and approximate delay, and an explicit
+connected-again confirmation. During retry, the foreground notification
+describes the same attempt/waiting status while the application is backgrounded.
+For permanent host/authorization failures, the normal error dialog remains
+and the banner says user action is needed.
+
+The banner and service do not imply the OS permits restart after Force Stop or
+process death. The *Activity still owns* Moonlight native transport and decoder;
+a foreground service is not yet equivalent to moving the entire session
+lifecycle into a process-persistent service.
+
+### Additional physical-device acceptance checks
+
+- Turn off Wi-Fi without closing the Activity; verify a visible loss banner
+  and a matching reconnecting notification. Restore Wi-Fi and check that
+  video, audio and input resume without tapping Connect.
+- Disconnect Apollo or the network while Android is in Recent Apps; verify
+  reconnect remains armed and the user sees state on reopening Artemis.
+- Force a host/native startup rejection; ensure the `connecting` state does
+  not stay stuck indefinitely and a new retry occurs.
+- Leave the network up but stop incoming video frames; verify a stalled
+  session is flagged after the video inactivity threshold.
+- Confirm no false reconnect on short network jitter, that manual Disconnect
+  cancels retries, and that the Stable app remains unaffected.

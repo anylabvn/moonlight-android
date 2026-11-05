@@ -36,11 +36,20 @@ public final class StreamSessionService extends Service {
     }
 
     public static void reconnecting(Context context) {
-        send(context, ACTION_RECONNECTING);
+        reconnecting(context, context.getString(R.string.stream_recovery_preparing));
+    }
+
+    public static void reconnecting(Context context, String status) {
+        send(context, ACTION_RECONNECTING, status);
     }
 
     private static void send(Context context, String action) {
+        send(context, action, null);
+    }
+
+    private static void send(Context context, String action, String status) {
         Intent intent = new Intent(context, StreamSessionService.class).setAction(action);
+        if (status != null) intent.putExtra("status", status);
         try {
             if (running) {
                 context.startService(intent);
@@ -112,7 +121,10 @@ public final class StreamSessionService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
         Notification notification = builder.setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle(getString(R.string.app_label) + " remote desktop")
-                .setContentText(ACTION_RECONNECTING.equals(action) ? "Reconnecting to the host" : "Streaming session active")
+                .setContentText(ACTION_RECONNECTING.equals(action)
+                        ? (intent != null && intent.getStringExtra("status") != null
+                        ? intent.getStringExtra("status") : getString(R.string.stream_recovery_preparing))
+                        : getString(R.string.stream_session_active))
                 .setContentIntent(open)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

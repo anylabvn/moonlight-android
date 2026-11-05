@@ -544,6 +544,10 @@ public class NvConnection {
                         // to stop the connection themselves. We need to release their
                         // semaphore count for them.
                         if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
+                        // A native startup failure must be visible to the Java
+                        // connection state machine. Without this callback, Game
+                        // remains connecting forever and will never retry.
+                        guardedListener.stageFailed("Native stream startup", 0, ret);
                         return;
                     }
                 }

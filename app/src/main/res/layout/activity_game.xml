@@ -88,6 +88,25 @@
 
     </LinearLayout>
 
+    <!-- Persistent connection state: visible even when network-quality warnings are disabled. -->
+    <TextView
+        android:id="@+id/connectionStateBanner"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="64dp"
+        android:layout_marginStart="18dp"
+        android:layout_marginEnd="18dp"
+        android:background="#DD22252A"
+        android:textColor="#FFFFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:padding="14dp"
+        android:elevation="100dp"
+        android:visibility="gone"
+        android:importantForAccessibility="yes" />
+
     <!-- Floating Menu Button -->
     <ImageButton
         android:id="@+id/floatingMenuButton"

@@ -141,6 +141,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private String glRenderer;
     private volatile boolean foreground = true;
     private volatile boolean discardVideoFrames;
+    private volatile long lastVideoFrameElapsedRealtime;
+
+    public long getLastVideoFrameElapsedRealtime() {
+        return lastVideoFrameElapsedRealtime;
+    }
     private SurfaceTexture parkedTexture;
     private Surface parkedSurface;
     private PerfOverlayListener perfListener;
@@ -854,6 +859,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     @Override
     public int setup(int format, int width, int height, int redrawRate) {
         stopping = false;
+        lastVideoFrameElapsedRealtime = 0L;
         this.targetFps = (redrawRate > 0 ? redrawRate : 60);
         this.initialWidth = invertResolution ? height : width;
         this.initialHeight = invertResolution ? width : height;
@@ -1688,7 +1694,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Wait for the renderer thread to shut down
         try {
-            rendererThread.join();
+            if (rendererThread != null) rendererThread.join();
         } catch (InterruptedException e) {
             e.printStackTrace();
 
@@ -2176,6 +2182,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         activeWindowVideoStats.totalFramesReceived++;
         activeWindowVideoStats.totalFrames++;
+        lastVideoFrameElapsedRealtime = SystemClock.elapsedRealtime();
 
         if (!FRAME_RENDER_TIME_ONLY) {
             // Count time from first packet received to enqueue time as receive time

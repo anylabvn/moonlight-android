@@ -42,6 +42,7 @@ import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.profiles.ProfilesManager;
 import com.limelight.stream.StreamRetryPolicy;
+import com.limelight.stream.StreamConnectionHealth;
 import com.limelight.stream.StreamSessionService;
 import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
@@ -87,6 +88,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.PersistableBundle;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Rational;
@@ -203,6 +205,28 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private Runnable pendingReconnect;
     private ConnectivityManager.NetworkCallback recoveryNetworkCallback;
     private final StreamRetryPolicy recoveryPolicy = new StreamRetryPolicy();
+    private static final long CONNECTION_START_TIMEOUT_MS = 45_000L;
+    private static final long VIDEO_STALL_TIMEOUT_MS = 25_000L;
+    private static final long STREAM_HEALTH_INTERVAL_MS = 5_000L;
+    private Runnable connectionStartTimeout;
+    private Runnable recoveryBannerHide;
+    private TextView connectionStateBanner;
+    private boolean hasRecoveredFromFailure;
+    private final Runnable streamHealthCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (!sessionDesired || isFinishing() || isDestroyed()) return;
+            if (connected && !recoveryStopping && decoderRenderer != null) {
+                long lastFrame = decoderRenderer.getLastVideoFrameElapsedRealtime();
+                if (StreamConnectionHealth.isVideoStalled(
+                        lastFrame, SystemClock.elapsedRealtime(), VIDEO_STALL_TIMEOUT_MS)) {
+                    beginStreamRecovery("Video stream stopped receiving frames");
+                    return;
+                }
+            }
+            timerHandler.postDelayed(this, STREAM_HEALTH_INTERVAL_MS);
+        }
+    };
     private int suppressPipRefCount = 0;
     private String pcName;
     private String appName;
@@ -401,6 +425,18 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                         }
                     });
                 }
+
+                @Override
+                public void onLost(Network network) {
+                    // A changed/default network path invalidates the UDP/TCP stream.
+                    // Moonlight native callbacks may not arrive promptly on a silent loss.
+                    timerHandler.post(() -> {
+                        if (sessionDesired && attemptedConnection &&
+                                (connected || connecting) && !recoveryStopping) {
+                            beginStreamRecovery("Android network connection lost");
+                        }
+                    });
+                }
             };
             networkManager.registerDefaultNetworkCallback(recoveryNetworkCallback);
         }
@@ -576,6 +612,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
 
         notificationOverlayView = findViewById(R.id.notificationOverlay);
+        connectionStateBanner = findViewById(R.id.connectionStateBanner);
 
         performanceOverlayView = findViewById(R.id.performanceOverlay);
 
@@ -939,6 +976,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 StreamSessionService.start(Game.this);
                 conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
                         decoderRenderer, Game.this);
+                armConnectionStartTimeout();
             } else if (streamVisible && (connected || connecting)) {
                 if (!decoderRenderer.restoreVideoSurface(surface)) {
                     beginStreamRecovery("Could not restore display Surface");
@@ -1801,6 +1839,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         sessionDesired = false;
         if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
         pendingReconnect = null;
+        cancelConnectionStartTimeout();
+        timerHandler.removeCallbacks(streamHealthCheck);
+        if (recoveryBannerHide != null) timerHandler.removeCallbacks(recoveryBannerHide);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && recoveryNetworkCallback != null) {
             ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE))
                     .unregisterNetworkCallback(recoveryNetworkCallback);
@@ -3704,6 +3745,42 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void stageComplete(String stage) {
     }
 
+    private void showConnectionState(String text) {
+        if (recoveryBannerHide != null) {
+            timerHandler.removeCallbacks(recoveryBannerHide);
+            recoveryBannerHide = null;
+        }
+        if (connectionStateBanner != null) {
+            connectionStateBanner.setText(text);
+            connectionStateBanner.setContentDescription(text);
+            connectionStateBanner.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void clearConnectionState() {
+        if (recoveryBannerHide != null) timerHandler.removeCallbacks(recoveryBannerHide);
+        recoveryBannerHide = null;
+        if (connectionStateBanner != null) connectionStateBanner.setVisibility(View.GONE);
+    }
+
+    private void cancelConnectionStartTimeout() {
+        if (connectionStartTimeout != null) timerHandler.removeCallbacks(connectionStartTimeout);
+        connectionStartTimeout = null;
+    }
+
+    private void armConnectionStartTimeout() {
+        cancelConnectionStartTimeout();
+        final long generation = conn.getAttemptGeneration();
+        connectionStartTimeout = () -> {
+            connectionStartTimeout = null;
+            if (sessionDesired && connecting && !recoveryStopping &&
+                    generation == conn.getAttemptGeneration()) {
+                beginStreamRecovery("Connection attempt timed out after 45 seconds");
+            }
+        };
+        timerHandler.postDelayed(connectionStartTimeout, CONNECTION_START_TIMEOUT_MS);
+    }
+
     /**
      * A transient failure owns exactly one stop -> retry transition.
      * No UI Activity recreation is necessary while this Activity remains alive.
@@ -3713,6 +3790,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 || recoveryStopping || pendingReconnect != null) return;
 
         LimeLog.warning("Recovering streaming session: " + reason);
+        cancelConnectionStartTimeout();
+        timerHandler.removeCallbacks(streamHealthCheck);
+        hasRecoveredFromFailure = true;
+        showConnectionState(getString(R.string.stream_connection_lost) + "\n" +
+                getString(R.string.stream_recovery_preparing));
         recoveryStopping = true;
         connecting = false;
         connected = false;
@@ -3747,6 +3829,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 || isFinishing() || isDestroyed()) return;
 
         long delay = recoveryPolicy.nextDelayMillis();
+        final int attemptNumber = recoveryPolicy.getFailureCount();
+        final String waitMessage = getString(R.string.stream_recovery_waiting,
+                attemptNumber, Math.max(1L, (delay + 999L) / 1000L));
+        showConnectionState(getString(R.string.stream_connection_lost) + "\n" + waitMessage);
+        StreamSessionService.reconnecting(this, waitMessage);
         pendingReconnect = () -> {
             pendingReconnect = null;
             if (!sessionDesired || isFinishing() || isDestroyed()
@@ -3765,13 +3852,16 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 return;
             }
 
-            LimeLog.info("Trying Artemis streaming session reconnect");
+            LimeLog.info("Trying Artemis streaming session reconnect, attempt " + attemptNumber);
             connecting = true;
             displayedFailureDialog = false;
-            StreamSessionService.reconnecting(this);
+            final String progress = getString(R.string.stream_recovery_attempt, attemptNumber);
+            showConnectionState(progress);
+            StreamSessionService.reconnecting(this, progress);
             conn.setRecoveryMode(true);
             conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
                     decoderRenderer, this);
+            armConnectionStartTimeout();
         };
         timerHandler.postDelayed(pendingReconnect, delay);
     }
@@ -3829,6 +3919,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
         // Stop unattended retries for problems that require explicit user action.
         sessionDesired = false;
+        cancelConnectionStartTimeout();
+        timerHandler.removeCallbacks(streamHealthCheck);
+        showConnectionState(getString(R.string.stream_recovery_needs_attention));
         StreamSessionService.stop(this);
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
@@ -4032,6 +4125,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             @Override
             public void run() {
                 if (!sessionDesired || !connecting || recoveryStopping) return;
+                cancelConnectionStartTimeout();
                 recoveryPolicy.reset();
                 conn.setRecoveryMode(false);
                 if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
@@ -4044,6 +4138,19 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                 connected = true;
                 connecting = false;
+                timerHandler.removeCallbacks(streamHealthCheck);
+                timerHandler.postDelayed(streamHealthCheck, STREAM_HEALTH_INTERVAL_MS);
+                if (hasRecoveredFromFailure) {
+                    final String recovered = getString(R.string.stream_recovery_connected);
+                    showConnectionState(recovered);
+                    recoveryBannerHide = () -> {
+                        if (connected && !recoveryStopping) clearConnectionState();
+                    };
+                    timerHandler.postDelayed(recoveryBannerHide, 3000L);
+                    hasRecoveredFromFailure = false;
+                } else {
+                    clearConnectionState();
+                }
                 updatePipAutoEnter();
 
                 // Hide the mouse cursor now after a short delay.
