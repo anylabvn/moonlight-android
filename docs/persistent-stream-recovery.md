@@ -106,8 +106,8 @@ a newer stream while Android's UI thread is busy.
   network quality does *not* automatically destroy a working connection.
 - The video decoder records the last received frame against a monotonic clock.
   Once streaming, a 25-second frame stall triggers recovery even if no native
-  error callback arrives. The monitor does not trigger until a real frame has
-  arrived, avoiding false positives for input-only sessions.
+  error callback arrives. A normal video session also triggers recovery if
+  its first frame never arrives; input-only sessions are excluded.
 - Recovery still serializes stop/retry against the global Moonlight bridge and
   prevents stale native callbacks from affecting a subsequent attempt.
 

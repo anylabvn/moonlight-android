@@ -212,14 +212,17 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private Runnable recoveryBannerHide;
     private TextView connectionStateBanner;
     private boolean hasRecoveredFromFailure;
+    private long lastSuccessfulConnectionElapsedMs;
     private final Runnable streamHealthCheck = new Runnable() {
         @Override
         public void run() {
             if (!sessionDesired || isFinishing() || isDestroyed()) return;
             if (connected && !recoveryStopping && decoderRenderer != null) {
                 long lastFrame = decoderRenderer.getLastVideoFrameElapsedRealtime();
-                if (StreamConnectionHealth.isVideoStalled(
-                        lastFrame, SystemClock.elapsedRealtime(), VIDEO_STALL_TIMEOUT_MS)) {
+                if (StreamConnectionHealth.isVideoInactive(
+                        lastFrame, lastSuccessfulConnectionElapsedMs,
+                        SystemClock.elapsedRealtime(), VIDEO_STALL_TIMEOUT_MS,
+                        !Objects.equals(appUUID, NvApp.REMOTE_INPUT_UUID))) {
                     beginStreamRecovery("Video stream stopped receiving frames");
                     return;
                 }
@@ -4138,6 +4141,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                 connected = true;
                 connecting = false;
+                lastSuccessfulConnectionElapsedMs = SystemClock.elapsedRealtime();
                 timerHandler.removeCallbacks(streamHealthCheck);
                 timerHandler.postDelayed(streamHealthCheck, STREAM_HEALTH_INTERVAL_MS);
                 if (hasRecoveredFromFailure) {

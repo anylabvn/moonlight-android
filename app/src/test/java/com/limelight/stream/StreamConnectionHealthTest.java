@@ -30,6 +30,22 @@ public class StreamConnectionHealthTest {
     }
 
     @Test
+    public void firstFrameTimeoutCanRecoverSilentVideoInitialization() {
+        assertFalse(StreamConnectionHealth.isVideoInactive(
+                0L, 1000L, 10000L, 25000L, true));
+        assertTrue(StreamConnectionHealth.isVideoInactive(
+                0L, 1000L, 26000L, 25000L, true));
+    }
+
+    @Test
+    public void inputOnlySessionsDoNotRequireVideoFrames() {
+        assertFalse(StreamConnectionHealth.isVideoInactive(
+                0L, 1000L, 200000L, 25000L, false));
+        assertFalse(StreamConnectionHealth.isVideoInactive(
+                1000L, 1000L, 200000L, 25000L, false));
+    }
+
+    @Test
     public void freshFrameAfterRecoveryResetsTheWindow() {
         assertTrue(StreamConnectionHealth.isVideoStalled(10000L, 40000L, 25000L));
         assertFalse(StreamConnectionHealth.isVideoStalled(39500L, 40000L, 25000L));

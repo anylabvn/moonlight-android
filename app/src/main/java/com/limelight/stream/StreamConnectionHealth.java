@@ -14,4 +14,17 @@ public final class StreamConnectionHealth {
         }
         return nowMs - lastFrameMs >= timeoutMs;
     }
+
+    /**
+     * A normal desktop stream is unhealthy if no video frames ever arrive
+     * within the same timeout, not only if frames stop arriving later.
+     * Input-only sessions are explicitly excluded.
+     */
+    public static boolean isVideoInactive(long lastFrameMs, long connectedAtMs,
+                                          long nowMs, long timeoutMs,
+                                          boolean expectsVideo) {
+        if (!expectsVideo) return false;
+        return isVideoStalled(lastFrameMs > 0 ? lastFrameMs : connectedAtMs,
+                nowMs, timeoutMs);
+    }
 }
