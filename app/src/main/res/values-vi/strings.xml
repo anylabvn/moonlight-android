@@ -643,6 +643,7 @@
     <string name="stream_recovery_preparing">Đang chuẩn bị tự kết nối lại…</string>
     <string name="stream_recovery_waiting">Thử lại lần %1$d sau khoảng %2$d giây — đang kiểm tra máy chủ</string>
     <string name="stream_recovery_attempt">Đang kết nối lại — lần %1$d…</string>
+    <string name="stream_recovery_waiting_video">Đã kết nối, đang chờ hình ảnh…</string>
     <string name="stream_recovery_connected">Đã kết nối lại</string>
     <string name="stream_recovery_needs_attention">Không thể kết nối — kiểm tra máy chủ hoặc ghép nối</string>
     <string name="stream_session_active">Đang kết nối máy tính từ xa</string>

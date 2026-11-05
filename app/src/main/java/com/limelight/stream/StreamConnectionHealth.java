@@ -15,6 +15,12 @@ public final class StreamConnectionHealth {
         return nowMs - lastFrameMs >= timeoutMs;
     }
 
+    /** A successful native handshake is not confirmed until media arrives. */
+    public static boolean isFreshVideoFrame(long lastFrameMs, long nowMs, long timeoutMs) {
+        return lastFrameMs > 0 && nowMs >= lastFrameMs &&
+                timeoutMs > 0 && nowMs - lastFrameMs < timeoutMs;
+    }
+
     /**
      * A normal desktop stream is unhealthy if no video frames ever arrive
      * within the same timeout, not only if frames stop arriving later.

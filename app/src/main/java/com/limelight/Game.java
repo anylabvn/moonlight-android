@@ -212,6 +212,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private Runnable recoveryBannerHide;
     private TextView connectionStateBanner;
     private boolean hasRecoveredFromFailure;
+    private boolean pendingMediaRecoveryConfirmation;
     private long lastSuccessfulConnectionElapsedMs;
     private final Runnable streamHealthCheck = new Runnable() {
         @Override
@@ -219,9 +220,15 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             if (!sessionDesired || isFinishing() || isDestroyed()) return;
             if (connected && !recoveryStopping && decoderRenderer != null) {
                 long lastFrame = decoderRenderer.getLastVideoFrameElapsedRealtime();
+                long nowMs = SystemClock.elapsedRealtime();
+                if (pendingMediaRecoveryConfirmation &&
+                        StreamConnectionHealth.isFreshVideoFrame(
+                                lastFrame, nowMs, VIDEO_STALL_TIMEOUT_MS)) {
+                    confirmStreamRecovered();
+                }
                 if (StreamConnectionHealth.isVideoInactive(
                         lastFrame, lastSuccessfulConnectionElapsedMs,
-                        SystemClock.elapsedRealtime(), VIDEO_STALL_TIMEOUT_MS,
+                        nowMs, VIDEO_STALL_TIMEOUT_MS,
                         !Objects.equals(appUUID, NvApp.REMOTE_INPUT_UUID))) {
                     beginStreamRecovery("Video stream stopped receiving frames");
                     return;
@@ -3760,6 +3767,17 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
     }
 
+    private void confirmStreamRecovered() {
+        pendingMediaRecoveryConfirmation = false;
+        hasRecoveredFromFailure = false;
+        StreamSessionService.start(this);
+        showConnectionState(getString(R.string.stream_recovery_connected));
+        recoveryBannerHide = () -> {
+            if (connected && !recoveryStopping) clearConnectionState();
+        };
+        timerHandler.postDelayed(recoveryBannerHide, 3000L);
+    }
+
     private void clearConnectionState() {
         if (recoveryBannerHide != null) timerHandler.removeCallbacks(recoveryBannerHide);
         recoveryBannerHide = null;
@@ -3800,6 +3818,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         cancelConnectionStartTimeout();
         timerHandler.removeCallbacks(streamHealthCheck);
         hasRecoveredFromFailure = true;
+        pendingMediaRecoveryConfirmation = false;
         showConnectionState(getString(R.string.stream_connection_lost) + "\n" +
                 getString(R.string.stream_recovery_preparing));
         recoveryStopping = true;
@@ -4141,7 +4160,6 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 conn.setRecoveryMode(false);
                 if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
                 pendingReconnect = null;
-                StreamSessionService.start(Game.this);
                 if (spinner != null) {
                     spinner.dismiss();
                     spinner = null;
@@ -4153,14 +4171,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 timerHandler.removeCallbacks(streamHealthCheck);
                 timerHandler.postDelayed(streamHealthCheck, STREAM_HEALTH_INTERVAL_MS);
                 if (hasRecoveredFromFailure) {
-                    final String recovered = getString(R.string.stream_recovery_connected);
-                    showConnectionState(recovered);
-                    recoveryBannerHide = () -> {
-                        if (connected && !recoveryStopping) clearConnectionState();
-                    };
-                    timerHandler.postDelayed(recoveryBannerHide, 3000L);
-                    hasRecoveredFromFailure = false;
+                    if (Objects.equals(appUUID, NvApp.REMOTE_INPUT_UUID)) {
+                        // Input-only sessions cannot confirm via video.
+                        confirmStreamRecovered();
+                    } else {
+                        // A native connected callback is not proof that the
+                        // remote desktop can render. Keep the indicator visible
+                        // until the decoder actually receives a video frame.
+                        pendingMediaRecoveryConfirmation = true;
+                        String waiting = getString(R.string.stream_recovery_waiting_video);
+                        showConnectionState(waiting);
+                        StreamSessionService.reconnecting(Game.this, waiting);
+                    }
                 } else {
+                    StreamSessionService.start(Game.this);
                     clearConnectionState();
                 }
                 updatePipAutoEnter();

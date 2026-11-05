@@ -197,3 +197,18 @@ These are source-level reliability corrections verified by CI tests and build,
 not device-confirmed reconnection. A physical Android/Apollo test still needs
 to establish that connection survives backgrounding and returns to usable
 audio/video/input after Wi-Fi and host failures.
+
+## Media-level recovery confirmation
+
+A native `connectionStarted()` callback proves that the transport handshake
+completed, **not** that the remote desktop is displaying new video. On a
+recovered video stream the session banner and notification now report
+"Transport connected — waiting for video" until a fresh decoded video unit
+arrives. Only then are they changed to "Connected again" and "streaming".
+If no frame arrives, the video inactivity watchdog continues monitoring and
+returns to recovery instead of falsely acknowledging success. Input-only
+sessions (without video) are confirmed from the transport event directly.
+
+Use an Apollo session that can show changing frames when validating the
+media-level success indicator; a synthetic native connection test alone does
+not cover full video/audio/input restoration.

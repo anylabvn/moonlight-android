@@ -46,6 +46,18 @@ public class StreamConnectionHealthTest {
     }
 
     @Test
+    public void nativeHandshakeDoesNotProveVideoRestored() {
+        assertFalse(StreamConnectionHealth.isFreshVideoFrame(0L, 10000L, 25000L));
+    }
+
+    @Test
+    public void recoveryIsConfirmedOnlyByFreshVideo() {
+        assertTrue(StreamConnectionHealth.isFreshVideoFrame(1000L, 2000L, 25000L));
+        assertFalse(StreamConnectionHealth.isFreshVideoFrame(1000L, 30000L, 25000L));
+        assertFalse(StreamConnectionHealth.isFreshVideoFrame(10000L, 9000L, 25000L));
+    }
+
+    @Test
     public void freshFrameAfterRecoveryResetsTheWindow() {
         assertTrue(StreamConnectionHealth.isVideoStalled(10000L, 40000L, 25000L));
         assertFalse(StreamConnectionHealth.isVideoStalled(39500L, 40000L, 25000L));
