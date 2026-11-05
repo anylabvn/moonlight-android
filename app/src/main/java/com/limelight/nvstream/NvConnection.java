@@ -122,9 +122,12 @@ public class NvConnection {
             if (bridgePermitHeld.getAndSet(false)) {
                 try {
                     MoonBridge.stopConnection();
-                    MoonBridge.cleanupBridge();
                 } finally {
-                    connectionAllowed.release();
+                    try {
+                        MoonBridge.cleanupBridge();
+                    } finally {
+                        connectionAllowed.release();
+                    }
                 }
             }
         }
@@ -516,17 +519,18 @@ public class NvConnection {
                     connectionAllowed.release();
                     return;
                 }
-                bridgePermitHeld.set(true);
-
-                // Moonlight-core is not thread-safe with respect to connection start and stop, so
-                // we must not invoke that functionality in parallel.
+                // Claim native ownership only after the global lock and a final
+                // cancellation check. stop() can otherwise run before native
+                // startConnection() ever begins.
                 synchronized (MoonBridge.class) {
                     if (generation != attemptGeneration.get()) {
-                        if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
+                        connectionAllowed.release();
                         return;
                     }
-                    MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, guardedListener);
-                    int ret = MoonBridge.startConnection(context.serverAddress.address,
+                    bridgePermitHeld.set(true);
+                    try {
+                        MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, guardedListener);
+                        int ret = MoonBridge.startConnection(context.serverAddress.address,
                             context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
                             context.serverCodecModeSupport,
                             context.negotiatedWidth, context.negotiatedHeight,
@@ -539,16 +543,19 @@ public class NvConnection {
                             context.videoCapabilities,
                             context.streamConfig.getColorSpace(),
                             context.streamConfig.getColorRange());
-                    if (ret != 0) {
-                        // LiStartConnection() failed, so the caller is not expected
-                        // to stop the connection themselves. We need to release their
-                        // semaphore count for them.
+                        if (ret != 0) {
+                            // Native connection startup already failed; release the
+                            // global Java bridge and let Game schedule a retry.
+                            MoonBridge.cleanupBridge();
+                            if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
+                            guardedListener.stageFailed("Native stream startup", 0, ret);
+                            return;
+                        }
+                    } catch (RuntimeException | LinkageError e) {
+                        LimeLog.warning("Native stream startup threw: " + e);
+                        MoonBridge.cleanupBridge();
                         if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
-                        // A native startup failure must be visible to the Java
-                        // connection state machine. Without this callback, Game
-                        // remains connecting forever and will never retry.
-                        guardedListener.stageFailed("Native stream startup", 0, ret);
-                        return;
+                        guardedListener.stageFailed("Native stream startup exception", 0, -408);
                     }
                 }
                 }

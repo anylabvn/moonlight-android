@@ -17,6 +17,31 @@ public class StreamRetryPolicyTest {
     }
 
     @Test
+    public void shortConnectionDoesNotResetFailureBackoff() {
+        StreamRetryPolicy policy = new StreamRetryPolicy(new Random(0));
+        for (int i = 0; i < 6; i++) policy.nextDelayMillis();
+        policy.onStreamEnded(1000L, 12000L);
+        assertEquals(6, policy.getFailureCount());
+    }
+
+    @Test
+    public void stableConnectionDoesResetFailureBackoff() {
+        StreamRetryPolicy policy = new StreamRetryPolicy(new Random(0));
+        for (int i = 0; i < 6; i++) policy.nextDelayMillis();
+        policy.onStreamEnded(1000L, 62000L);
+        assertEquals(0, policy.getFailureCount());
+    }
+
+    @Test
+    public void invalidOrAbsentConnectedTimeCannotResetBackoff() {
+        StreamRetryPolicy policy = new StreamRetryPolicy(new Random(0));
+        policy.nextDelayMillis();
+        policy.onStreamEnded(0L, 80000L);
+        policy.onStreamEnded(90000L, 80000L);
+        assertEquals(1, policy.getFailureCount());
+    }
+
+    @Test
     public void reconnectSuccessResetsBackoff() {
         StreamRetryPolicy policy = new StreamRetryPolicy(new Random(0));
         for (int i = 0; i < 20; i++) policy.nextDelayMillis();

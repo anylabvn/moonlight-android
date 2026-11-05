@@ -11,6 +11,7 @@ public final class StreamRetryPolicy {
     private static final long[] BASE_DELAYS_MS = {1000, 2000, 4000, 8000, 15000, 30000};
     private final Random random;
     private int failures;
+    private static final long STABLE_CONNECTION_MS = 60_000L;
 
     public StreamRetryPolicy() {
         this(new Random());
@@ -29,6 +30,18 @@ public final class StreamRetryPolicy {
 
     public void reset() {
         failures = 0;
+    }
+
+    /**
+     * A connection that survives only a few seconds isn't stable enough to
+     * reset exponential backoff. This prevents repeated one-second reconnects
+     * when the server or network is flapping.
+     */
+    public void onStreamEnded(long connectedAtMs, long endedAtMs) {
+        if (connectedAtMs > 0 && endedAtMs >= connectedAtMs &&
+                endedAtMs - connectedAtMs >= STABLE_CONNECTION_MS) {
+            reset();
+        }
     }
 
     public int getFailureCount() {

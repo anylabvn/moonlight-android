@@ -11,6 +11,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 
 import com.limelight.Game;
 import com.limelight.R;
@@ -30,6 +31,7 @@ public final class StreamSessionService extends Service {
     private static final String CHANNEL_ID = "artemis_stream_session";
     private static final int NOTIFICATION_ID = 7801;
     private static volatile boolean running;
+    private PowerManager.WakeLock sessionWakeLock;
 
     public static void start(Context context) {
         send(context, ACTION_STREAMING);
@@ -131,11 +133,28 @@ public final class StreamSessionService extends Service {
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stop)
                 .build();
         startForeground(NOTIFICATION_ID, notification);
+        // Foreground service does not by itself keep CPU awake. Preserve
+        // native keepalives and retry deadlines while the screen is off.
+        if (sessionWakeLock == null) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                sessionWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                        getPackageName() + ":StreamSession");
+                sessionWakeLock.setReferenceCounted(false);
+            }
+        }
+        if (sessionWakeLock != null && !sessionWakeLock.isHeld()) {
+            sessionWakeLock.acquire();
+        }
         return START_NOT_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        if (sessionWakeLock != null && sessionWakeLock.isHeld()) {
+            sessionWakeLock.release();
+        }
+        sessionWakeLock = null;
         running = false;
         super.onDestroy();
     }

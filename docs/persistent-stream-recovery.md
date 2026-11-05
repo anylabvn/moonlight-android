@@ -151,3 +151,30 @@ device codecs reject `MediaCodec.setOutputSurface` even for supported
 Surface types; these failures must trigger full recovery instead of claiming
 the live stream was preserved. This compatibility change is grounded in the
 Android platform API contract but still requires device validation on MIUI.
+
+## Screen-off reliability and native ownership hardening
+
+The foreground service also holds a partial CPU wake lock while the user-
+requested streaming session exists. Android's foreground-service notification
+alone does not prevent deep sleep from delaying keepalives and the retry handler.
+The wake lock is released by `StreamSessionService.onDestroy()`. This can
+increase power consumption while a stream is running in the background; it is
+not a bypass for system Force Stop or OEM process termination.
+
+`NvConnection` now claims the global MoonBridge ownership permit under its
+native synchronization lock, **after** the last generation/cancellation check.
+Previously, a concurrent stop could see ownership before native startup and
+attempt to stop an uninitialized connection. A failed native start cleans
+Java bridge references and releases the permit before notifying the Activity.
+Native stop cleanup also releases the permit if cleanup itself throws.
+
+Automatic retry keeps the exponential failure count across short-lived
+connection handshakes. It resets only after an uninterrupted connection has
+survived 60 seconds. This reduces fast reconnection storms on flapping networks
+and does not change the cap on retries.
+
+**Device acceptance, still required:** screen-off for several minutes, return
+to streaming without touching Connect, toggle Wi-Fi and restore Apollo, check
+accurate visible state/notification, verify no more than one live connection,
+and confirm the explicit Disconnect action releases its foreground wake lock.
+A CPU wake lock cannot guarantee that a vendor ROM will keep the process alive.

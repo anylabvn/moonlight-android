@@ -198,7 +198,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean autoEnterPip = false;
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
-    private boolean sessionDesired = true;
+    private volatile boolean sessionDesired = true;
     private boolean streamVisible = true;
     private boolean recoveryStopping = false;
     private volatile boolean finalCleanupEnqueued;
@@ -3793,6 +3793,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 || recoveryStopping || pendingReconnect != null) return;
 
         LimeLog.warning("Recovering streaming session: " + reason);
+        if (connected) {
+            recoveryPolicy.onStreamEnded(lastSuccessfulConnectionElapsedMs,
+                    SystemClock.elapsedRealtime());
+        }
         cancelConnectionStartTimeout();
         timerHandler.removeCallbacks(streamHealthCheck);
         hasRecoveredFromFailure = true;
@@ -4129,7 +4133,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             public void run() {
                 if (!sessionDesired || !connecting || recoveryStopping) return;
                 cancelConnectionStartTimeout();
-                recoveryPolicy.reset();
+                // Do not reset retry backoff for a brief reconnect handshake.
+                // A subsequent recovery resets only after a stable session.
                 conn.setRecoveryMode(false);
                 if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
                 pendingReconnect = null;
