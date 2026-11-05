@@ -51,7 +51,10 @@ public class StartupTest {
     @Test
     public void testApplicationStartup() {
         // Test ArtemisApplication creation and initialization
-        ArtemisApplication app = new ArtemisApplication();
+        // Exercise Android-managed Application creation with an attached Context.
+        ArtemisApplication app =
+                (ArtemisApplication) ApplicationProvider.getApplicationContext();
+        assertNotNull(app);
         app.onCreate();
 
         // Verify ProfilesManager was initialized

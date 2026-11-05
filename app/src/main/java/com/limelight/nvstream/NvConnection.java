@@ -12,6 +12,8 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.RouteInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -25,6 +27,9 @@ import java.util.Objects;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -48,7 +53,24 @@ public class NvConnection {
     private LimelightCryptoProvider cryptoProvider;
     private String uniqueId;
     private ConnectionContext context;
-    private static Semaphore connectionAllowed = new Semaphore(1);
+    private static final Semaphore connectionAllowed = new Semaphore(1);
+    private final AtomicBoolean bridgePermitHeld = new AtomicBoolean(false);
+    private final AtomicLong attemptGeneration = new AtomicLong();
+    private final Object startupLock = new Object();
+    private volatile boolean recoveryMode;
+    private volatile boolean permanentStartFailure;
+
+    public void setRecoveryMode(boolean recoveryMode) {
+        this.recoveryMode = recoveryMode;
+    }
+
+    public boolean isPermanentStartFailure() {
+        return permanentStartFailure;
+    }
+
+    public long getAttemptGeneration() {
+        return attemptGeneration.get();
+    }
     private final boolean isMonkey;
     private final Context appContext;
 
@@ -90,18 +112,30 @@ public class NvConnection {
     }
 
     public void stop() {
-        // Interrupt any pending connection. This is thread-safe.
-        MoonBridge.interruptConnection();
-
-        // Moonlight-core is not thread-safe with respect to connection start and stop, so
-        // we must not invoke that functionality in parallel.
-        synchronized (MoonBridge.class) {
-            MoonBridge.stopConnection();
-            MoonBridge.cleanupBridge();
+        // A failed HTTP preflight never owns a native bridge permit.
+        attemptGeneration.incrementAndGet();
+        // MoonBridge is global. Do not interrupt another NvConnection instance
+        // when this one has only an outstanding HTTP preflight (no native bridge).
+        if (!bridgePermitHeld.get()) return;
+        try {
+            MoonBridge.interruptConnection();
+        } catch (RuntimeException e) {
+            // Still release our bridge ownership and semaphore below.
+            LimeLog.warning("Native interrupt failed during cleanup: " + e);
         }
-
-        // Now a pending connection can be processed
-        connectionAllowed.release();
+        synchronized (MoonBridge.class) {
+            if (bridgePermitHeld.getAndSet(false)) {
+                try {
+                    MoonBridge.stopConnection();
+                } finally {
+                    try {
+                        MoonBridge.cleanupBridge();
+                    } finally {
+                        connectionAllowed.release();
+                    }
+                }
+            }
+        }
     }
 
     private InetAddress resolveServerAddress() throws IOException {
@@ -241,6 +275,7 @@ public class NvConnection {
         context.serverGfeVersion = h.getGfeVersion(serverInfo);
                 
         if (h.getPairState(serverInfo) != PairingManager.PairState.PAIRED) {
+            permanentStartFailure = true;
             context.connListener.displayMessage("Device not paired with computer");
             return false;
         }
@@ -305,6 +340,7 @@ public class NvConnection {
             LimeLog.info("Using deprecated app lookup method - Please specify an app ID in your StreamConfiguration instead");
             app = h.getAppByName(context.streamConfig.getApp().getAppName());
             if (app == null) {
+                permanentStartFailure = true;
                 context.connListener.displayMessage("The app " + context.streamConfig.getApp().getAppName() + " is not in GFE app list");
                 return false;
             }
@@ -322,10 +358,16 @@ public class NvConnection {
                     // When launching InputOnly, we shouldn't try terminating the current running app
                     return launchNotRunningApp(h, context);
                 } else {
+                    if (recoveryMode) {
+                        permanentStartFailure = true;
+                        context.connListener.displayMessage("Another app is streaming on the host. Artemis will not close it during recovery.");
+                        return false;
+                    }
                     return quitAndLaunch(h, context);
                 }
             } catch (HostHttpResponseException e) {
                 if (e.getErrorCode() == 470) {
+                    permanentStartFailure = true;
                     // This is the error you get when you try to resume a session that's not yours.
                     // Because this is fairly common, we'll display a more detailed message.
                     context.connListener.displayMessage("This session wasn't started by this device," +
@@ -334,6 +376,7 @@ public class NvConnection {
                     return false;
                 }
                 else if (e.getErrorCode() == 525) {
+                    permanentStartFailure = true;
                     context.connListener.displayMessage("The application is minimized. Resume it on the PC manually or " +
                             "quit the session and start streaming again.");
                     return false;
@@ -387,9 +430,22 @@ public class NvConnection {
 
     public void start(final AudioRenderer audioRenderer, final VideoDecoderRenderer videoDecoderRenderer, final NvConnectionListener connectionListener)
     {
+        final long generation = attemptGeneration.incrementAndGet();
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
+        final NvConnectionListener guardedListener =
+                new GenerationGuardedConnectionListener(attemptGeneration, generation,
+                        connectionListener, command -> mainHandler.post(command));
         new Thread(new Runnable() {
             public void run() {
-                context.connListener = connectionListener;
+                try {
+                // HTTP preflights from separate attempts must never mutate the shared
+                // ConnectionContext concurrently or launch/resume competing host sessions.
+                synchronized (startupLock) {
+                if (generation != attemptGeneration.get()) return;
+                permanentStartFailure = false;
+                context.riKey = generateRiAesKey();
+                context.riKeyId = generateRiKeyId();
+                context.connListener = guardedListener;
                 context.videoCapabilities = videoDecoderRenderer.getCapabilities();
 
                 String appName = context.streamConfig.getApp().getAppName();
@@ -399,6 +455,7 @@ public class NvConnection {
                 int tryCount = 0;
 
                 do {
+                    if (generation != attemptGeneration.get()) return;
                     boolean retry = false;
                     try {
                         if (!startApp()) {
@@ -439,24 +496,47 @@ public class NvConnection {
                     return;
                 }
 
+                if (generation != attemptGeneration.get()) return;
                 ByteBuffer ib = ByteBuffer.allocate(16);
                 ib.putInt(context.riKeyId);
 
                 // Acquire the connection semaphore to ensure we only have one
                 // connection going at once.
                 try {
-                    connectionAllowed.acquire();
+                    // A cancelled attempt must not block forever behind another
+                    // session's global bridge permit.
+                    boolean acquired = false;
+                    while (generation == attemptGeneration.get() && !acquired) {
+                        acquired = connectionAllowed.tryAcquire(250, TimeUnit.MILLISECONDS);
+                    }
+                    if (!acquired) return;
+                    if (generation != attemptGeneration.get()) {
+                        connectionAllowed.release();
+                        return;
+                    }
                 } catch (InterruptedException e) {
-                    context.connListener.displayMessage(e.getMessage());
+                    Thread.currentThread().interrupt();
+                    context.connListener.displayMessage("Connection attempt interrupted");
                     context.connListener.stageFailed(appName, 0, 0);
                     return;
                 }
 
-                // Moonlight-core is not thread-safe with respect to connection start and stop, so
-                // we must not invoke that functionality in parallel.
+                if (generation != attemptGeneration.get()) {
+                    connectionAllowed.release();
+                    return;
+                }
+                // Claim native ownership only after the global lock and a final
+                // cancellation check. stop() can otherwise run before native
+                // startConnection() ever begins.
                 synchronized (MoonBridge.class) {
-                    MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, connectionListener);
-                    int ret = MoonBridge.startConnection(context.serverAddress.address,
+                    if (generation != attemptGeneration.get()) {
+                        connectionAllowed.release();
+                        return;
+                    }
+                    bridgePermitHeld.set(true);
+                    try {
+                        MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, guardedListener);
+                        int ret = MoonBridge.startConnection(context.serverAddress.address,
                             context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
                             context.serverCodecModeSupport,
                             context.negotiatedWidth, context.negotiatedHeight,
@@ -469,16 +549,30 @@ public class NvConnection {
                             context.videoCapabilities,
                             context.streamConfig.getColorSpace(),
                             context.streamConfig.getColorRange());
-                    if (ret != 0) {
-                        // LiStartConnection() failed, so the caller is not expected
-                        // to stop the connection themselves. We need to release their
-                        // semaphore count for them.
-                        connectionAllowed.release();
-                        return;
+                        if (ret != 0) {
+                            // Native connection startup already failed; release the
+                            // global Java bridge and let Game schedule a retry.
+                            MoonBridge.cleanupBridge();
+                            if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
+                            guardedListener.stageFailed("Native stream startup", 0, ret);
+                            return;
+                        }
+                    } catch (RuntimeException | LinkageError e) {
+                        LimeLog.warning("Native stream startup threw: " + e);
+                        MoonBridge.cleanupBridge();
+                        if (bridgePermitHeld.getAndSet(false)) connectionAllowed.release();
+                        guardedListener.stageFailed("Native stream startup exception", 0, -408);
                     }
                 }
+                }
+                } catch (RuntimeException e) {
+                    // Unexpected HTTP/parser/startup runtime faults must not
+                    // leave Game.connecting stuck until its 45s watchdog.
+                    LimeLog.warning("Connection preflight exception: " + e);
+                    guardedListener.stageFailed("Connection preflight exception", 0, -408);
+                }
             }
-        }).start();
+        }, "Artemis - connection preflight").start();
     }
 
     public void sendExecServerCmd(final int cmdId) {

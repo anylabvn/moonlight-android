@@ -1035,6 +1035,9 @@ public class KeyMapper {
         linuxToWindowsKeyMap[KEY_PAUSE] = VK_PAUSE;
         linuxToWindowsKeyMap[KEY_INSERT] = VK_INSERT;
         linuxToWindowsKeyMap[KEY_HOME] = VK_HOME;
+        // The nabu keyboard exposes its consumer Home key as Linux KEY_HOMEPAGE.
+        // Treat it as the PC Home key for the dedicated remote-hotkey relay.
+        linuxToWindowsKeyMap[KEY_HOMEPAGE] = VK_HOME;
         linuxToWindowsKeyMap[KEY_PAGEUP] = VK_PRIOR;
         linuxToWindowsKeyMap[KEY_DELETE] = VK_DELETE;
         linuxToWindowsKeyMap[KEY_END] = VK_END;

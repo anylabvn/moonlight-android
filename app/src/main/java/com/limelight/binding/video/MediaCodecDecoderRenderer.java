@@ -42,6 +42,7 @@ import android.os.SystemClock;
 import android.util.Range;
 import android.view.Choreographer;
 import android.view.Surface;
+import android.graphics.SurfaceTexture;
 
 public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
     // Latency profile: favor minimal end-to-end delay over absolute smoothness.
@@ -69,14 +70,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             long now = System.nanoTime();
             boolean immediate = preferLowerDelays && (frameTimeNanos <= now + 300_000L);
             if (immediate) {
-                videoDecoder.releaseOutputBuffer(bufferIndex, true);
+                releaseFrame(bufferIndex, true);
             } else {
-                videoDecoder.releaseOutputBuffer(bufferIndex, frameTimeNanos);
+                releaseFrame(bufferIndex, frameTimeNanos);
             }
         } catch (Throwable t) {
             try {
                 // Fallback to immediate if timestamped release fails for any reason
-                videoDecoder.releaseOutputBuffer(bufferIndex, true);
+                releaseFrame(bufferIndex, true);
             } catch (Throwable ignored) {}
         }
     }
@@ -138,7 +139,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean reportedCrash;
     private int consecutiveCrashCount;
     private String glRenderer;
-    private boolean foreground = true;
+    private volatile boolean foreground = true;
+    private volatile boolean discardVideoFrames;
+    private volatile long lastVideoFrameElapsedRealtime;
+
+    public long getLastVideoFrameElapsedRealtime() {
+        return lastVideoFrameElapsedRealtime;
+    }
+    private SurfaceTexture parkedTexture;
+    private Surface parkedSurface;
     private PerfOverlayListener perfListener;
 
     private static final int CR_MAX_TRIES = 10;
@@ -358,8 +367,67 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return decoderInfo;
     }
 
-    public void setRenderTarget(Surface renderTarget) {
-        this.renderTarget = renderTarget;
+    public synchronized void setRenderTarget(Surface target) { renderTarget = target; }
+
+    public synchronized boolean parkVideoSurface() {
+        discardVideoFrames = true;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+        try {
+            if (parkedSurface == null) {
+                // API 26+ supports detached SurfaceTexture creation without
+                // requiring an OpenGL texture/context (the stream is parked
+                // with decoded output buffers discarded, not rendered).
+                // SurfaceTexture(0) attaches to texture name zero, which is
+                // unreliable on some Android GPU/codec combinations.
+                parkedTexture = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                        ? new SurfaceTexture(false) : new SurfaceTexture(0);
+                parkedTexture.setDefaultBufferSize(16, 16);
+                parkedSurface = new Surface(parkedTexture);
+            }
+            return switchSurface(parkedSurface);
+        } catch (RuntimeException e) {
+            LimeLog.warning("Cannot park video Surface: " + e);
+            return false;
+        }
+    }
+
+    public synchronized boolean restoreVideoSurface(Surface surface) {
+        if (!switchSurface(surface)) return false;
+        discardVideoFrames = false;
+        return true;
+    }
+
+    private boolean switchSurface(Surface surface) {
+        if (surface == null || !surface.isValid()) return false;
+        if (renderTarget == surface) return true;
+        if (videoDecoder != null && !stopping) {
+            try { videoDecoder.setOutputSurface(surface); }
+            catch (RuntimeException e) {
+                LimeLog.warning("Decoder output Surface switch failed: " + e);
+                return false;
+            }
+        }
+        renderTarget = surface;
+        return true;
+    }
+
+    public synchronized boolean hasUsableRenderTarget() {
+        return renderTarget != null && renderTarget.isValid();
+    }
+
+    public synchronized void releaseParkedSurface() {
+        if (parkedSurface != null) parkedSurface.release();
+        if (parkedTexture != null) parkedTexture.release();
+        parkedSurface = null;
+        parkedTexture = null;
+    }
+
+    private void releaseFrame(int index, boolean render) {
+        videoDecoder.releaseOutputBuffer(index, render && !discardVideoFrames);
+    }
+    private void releaseFrame(int index, long timestampNanos) {
+        if (!discardVideoFrames) videoDecoder.releaseOutputBuffer(index, timestampNanos);
+        else videoDecoder.releaseOutputBuffer(index, false);
     }
 
     public MediaCodecDecoderRenderer(Activity activity, PreferenceConfiguration prefs,
@@ -794,8 +862,51 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return 0;
     }
 
+    /**
+     * Reset per-stream codec state before starting a new native transport.
+     * A reconnect reuses this renderer object, unlike opening a new Game
+     * Activity. Old codec indexes, CSD, frame numbers and pacing state must
+     * never leak into the replacement stream.
+     *
+     * Called only after the prior native bridge finished stop()/cleanup().
+     * Do not reset renderTarget: it points to the new visible/parked Surface
+     * already selected by the reconnect coordinator.
+     */
+    private void resetStreamDecoderState() {
+        nextInputBufferIndex = -1;
+        nextInputBuffer = null;
+        legacyInputBuffers = null;
+        outputBufferQueue.clear();
+        vpsBuffers.clear();
+        spsBuffers.clear();
+        ppsBuffers.clear();
+        submittedCsd = false;
+        currentHdrMetadata = null;
+        savedSps = null;
+        needsBaselineSpsHack = false;
+
+        lastFrameNumber = 0;
+        lastTimestampUs = 0L;
+        lastRenderedFrameTimeNanos = 0L;
+        lastVideoFrameElapsedRealtime = 0L;
+        lastNetDataNum = 0L;
+        numSpsIn = numPpsIn = numVpsIn = 0;
+        numFramesIn = numFramesOut = 0;
+
+        activeWindowVideoStats = new VideoStats();
+        lastWindowVideoStats = new VideoStats();
+        globalVideoStats = new VideoStats();
+        codecRecoveryType.set(CR_RECOVERY_TYPE_NONE);
+        codecRecoveryThreadQuiescedFlags = 0;
+        codecRecoveryAttempts = 0;
+        initialException = null;
+        initialExceptionTimestamp = 0L;
+    }
+
     @Override
     public int setup(int format, int width, int height, int redrawRate) {
+        resetStreamDecoderState();
+        stopping = false;
         this.targetFps = (redrawRate > 0 ? redrawRate : 60);
         this.initialWidth = invertResolution ? height : width;
         this.initialHeight = invertResolution ? width : height;
@@ -1094,7 +1205,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             // ULL: present at next VSYNC (no scheduling)
                             releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
                             // Smooth/Balanced: keep timestamp scheduling
-                            videoDecoder.releaseOutputBuffer(nextOutputBuffer, frameTimeNanos);
+                            releaseFrame(nextOutputBuffer, frameTimeNanos);
                         }
 
                     }
@@ -1114,7 +1225,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 } catch (IllegalStateException ignored) {
                     try {
                         // Try to avoid leaking the output buffer by releasing it without rendering
-                        videoDecoder.releaseOutputBuffer(nextOutputBuffer, false);
+                        releaseFrame(nextOutputBuffer, false);
                     } catch (IllegalStateException e) {
                         // This will leak nextOutputBuffer, but there's really nothing else we can do
                         e.printStackTrace();
@@ -1220,7 +1331,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             // Drain non-blocking; keep only the newest buffer
                             while (__idx >= 0) {
                                 if (__last >= 0) {
-                                    try { videoDecoder.releaseOutputBuffer(__last, false); } catch (Throwable ignored) {}
+                                    try { releaseFrame(__last, false); } catch (Throwable ignored) {}
                                 }
                                 __last = __idx;
                                 __lastPtsUs = __tmpInfo.presentationTimeUs;
@@ -1284,7 +1395,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             if (prefs.framePacing != PreferenceConfiguration.FRAME_PACING_BALANCED) {
                                 // Get the last output buffer in the queue
                                 while ((outIndex = videoDecoder.dequeueOutputBuffer(info, getOutputDequeueTimeoutUs())) >= 0) {
-                                    videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                    releaseFrame(lastIndex, false);
                                     frameDropped = true; // we're discarding the oldest one
 
                                     numFramesOut++;
@@ -1311,7 +1422,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                                 // ULL: present at next VSYNC (no scheduling)
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                                 // Smooth/Balanced: keep timestamp scheduling
-                                                videoDecoder.releaseOutputBuffer(lastIndex, /* render */ false);
+                                                releaseFrame(lastIndex, /* render */ false);
                                             }
 
                                             frameDropped = true;
@@ -1324,7 +1435,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             // ULL: present at next VSYNC (no scheduling)
                                             releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                             // Smooth/Balanced: keep timestamp scheduling
-                                            videoDecoder.releaseOutputBuffer(lastIndex, nowNs);
+                                            releaseFrame(lastIndex, nowNs);
                                         }
 
                                         lastPresentNs = nowNs;
@@ -1341,7 +1452,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             if (android.os.Build.VERSION.SDK_INT >= 21) {
                                                 long __ts = System.nanoTime();
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
-                                                videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                                releaseFrame(lastIndex, false);
                                             }
                                         }
 
@@ -1384,7 +1495,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                                 // ULL: present at next VSYNC (no scheduling)
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                                 // Smooth/Balanced: keep timestamp scheduling
-                                                videoDecoder.releaseOutputBuffer(lastIndex, /* render */ false);
+                                                releaseFrame(lastIndex, /* render */ false);
                                             }
 
                                             frameDropped = true;
@@ -1397,7 +1508,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             // ULL: present at next VSYNC (no scheduling)
                                             releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                             // Smooth/Balanced: keep timestamp scheduling
-                                            videoDecoder.releaseOutputBuffer(lastIndex, nowNs);
+                                            releaseFrame(lastIndex, nowNs);
                                         }
 
                                         lastPresentNs = nowNs;
@@ -1415,7 +1526,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             if (android.os.Build.VERSION.SDK_INT >= 21) {
                                                 long __ts = System.nanoTime();
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
-                                                videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                                releaseFrame(lastIndex, false);
                                             }
                                         }
 
@@ -1438,7 +1549,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // refresh rate).
                                 if (outputBufferQueue.size() == OUTPUT_BUFFER_QUEUE_LIMIT) {
                                     try {
-                                        videoDecoder.releaseOutputBuffer(outputBufferQueue.take(), false);
+                                        releaseFrame(outputBufferQueue.take(), false);
                                         frameDropped = true;
                                     } catch (InterruptedException e) {
                                         return;
@@ -1630,7 +1741,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Wait for the renderer thread to shut down
         try {
-            rendererThread.join();
+            if (rendererThread != null) rendererThread.join();
         } catch (InterruptedException e) {
             e.printStackTrace();
 
@@ -1642,8 +1753,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     @Override
-    public void cleanup() {
-        videoDecoder.release();
+    public synchronized void cleanup() {
+        if (videoDecoder != null) {
+            try { videoDecoder.release(); }
+            finally { videoDecoder = null; }
+        }
     }
 
     @Override
@@ -2115,6 +2229,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         activeWindowVideoStats.totalFramesReceived++;
         activeWindowVideoStats.totalFrames++;
+        lastVideoFrameElapsedRealtime = SystemClock.elapsedRealtime();
 
         if (!FRAME_RENDER_TIME_ONLY) {
             // Count time from first packet received to enqueue time as receive time

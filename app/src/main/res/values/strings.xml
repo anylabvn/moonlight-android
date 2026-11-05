@@ -743,4 +743,14 @@
 
     <string name="title_checkbox_full_screen">Enable Full Screen</string>
     <string name="summary_checkbox_full_screen">Hide system bars with immersive mode</string>
+    <!-- Persistent streaming recovery statuses -->
+    <string name="stream_recovery_cleanup_failed">Unable to close old connection — reconnect stopped for safety</string>
+    <string name="stream_connection_lost">CONNECTION LOST</string>
+    <string name="stream_recovery_preparing">Preparing automatic reconnect…</string>
+    <string name="stream_recovery_waiting">Retry %1$d in about %2$d s — checking the host</string>
+    <string name="stream_recovery_attempt">Reconnecting to host — attempt %1$d…</string>
+    <string name="stream_recovery_waiting_video">Transport connected — waiting for video…</string>
+    <string name="stream_recovery_connected">Connected again</string>
+    <string name="stream_recovery_needs_attention">Connection failed — check the host or pairing</string>
+    <string name="stream_session_active">Remote desktop connected</string>
 </resources>

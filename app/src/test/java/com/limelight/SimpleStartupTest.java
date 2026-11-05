@@ -56,7 +56,11 @@ public class SimpleStartupTest {
         // Test application onCreate which initializes ProfilesManager
         // After the fix, this should no longer crash
         try {
-            ArtemisApplication app = new ArtemisApplication();
+            // Use the Android-created Application with its attached Context.
+            // Invoking onCreate after resetting ProfilesManager tests initialization.
+            ArtemisApplication app =
+                    (ArtemisApplication) ApplicationProvider.getApplicationContext();
+            assertNotNull(app);
             app.onCreate();
 
             // Should now work without crashing

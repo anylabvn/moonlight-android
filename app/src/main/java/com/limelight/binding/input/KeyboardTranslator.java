@@ -158,6 +158,22 @@ public class KeyboardTranslator implements InputManager.InputDeviceListener {
         }
     }
 
+    /**
+     * Translate a raw Linux scan code without consulting the Android key code.
+     *
+     * Dedicated input relays can intentionally expose harmless Android key codes
+     * while preserving the original scan code. This path lets a trusted caller
+     * forward that scan code without Force-QWERTY normalization.
+     */
+    public short translateRawScancode(int scancode) {
+        int translated = KeyMapper.getWindowsKeyCode(scancode);
+        if (translated < 0) {
+            return 0;
+        }
+
+        return (short) ((KEY_PREFIX << 8) | translated);
+    }
+
     public boolean hasNormalizedMapping(int keycode, int deviceId) {
         if (deviceId >= 0) {
             KeyboardMapping mapping = keyboardMappings.get(deviceId);

@@ -13,6 +13,7 @@ import com.limelight.binding.audio.AndroidAudioRenderer;
 import com.limelight.binding.input.ControllerHandler;
 import com.limelight.binding.input.GameInputDevice;
 import com.limelight.binding.input.KeyboardTranslator;
+import com.limelight.binding.input.StreamEscapeKeyPolicy;
 import com.limelight.binding.input.capture.InputCaptureManager;
 import com.limelight.binding.input.capture.InputCaptureProvider;
 import com.limelight.binding.input.touch.AbsoluteTouchContext;
@@ -40,11 +41,16 @@ import com.limelight.nvstream.jni.MoonBridge;
 import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.profiles.ProfilesManager;
+import com.limelight.stream.StreamRetryPolicy;
+import com.limelight.stream.StreamConnectionHealth;
+import com.limelight.stream.StreamReconnectCycle;
+import com.limelight.stream.StreamSessionService;
 import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
 import com.limelight.ui.StreamContainer;
 import com.limelight.utils.Dialog;
 import com.limelight.utils.ExternalDisplayControlActivity;
+import com.limelight.utils.KeyMapper;
 import com.limelight.utils.MouseModeOption;
 import com.limelight.utils.PanZoomHandler;
 import com.limelight.utils.PerformanceDataTracker;
@@ -76,12 +82,14 @@ import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.PersistableBundle;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Rational;
@@ -191,6 +199,46 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean autoEnterPip = false;
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
+    private volatile boolean sessionDesired = true;
+    private boolean streamVisible = true;
+    private boolean recoveryStopping = false;
+    private volatile boolean finalCleanupEnqueued;
+    private Runnable pendingReconnect;
+    private ConnectivityManager.NetworkCallback recoveryNetworkCallback;
+    private final StreamRetryPolicy recoveryPolicy = new StreamRetryPolicy();
+    private final StreamReconnectCycle reconnectCycle = new StreamReconnectCycle();
+    private static final long CONNECTION_START_TIMEOUT_MS = 45_000L;
+    private static final long VIDEO_STALL_TIMEOUT_MS = 25_000L;
+    private static final long STREAM_HEALTH_INTERVAL_MS = 5_000L;
+    private Runnable connectionStartTimeout;
+    private Runnable recoveryBannerHide;
+    private TextView connectionStateBanner;
+    private boolean hasRecoveredFromFailure;
+    private boolean pendingMediaRecoveryConfirmation;
+    private long lastSuccessfulConnectionElapsedMs;
+    private final Runnable streamHealthCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (!sessionDesired || isFinishing() || isDestroyed()) return;
+            if (connected && !recoveryStopping && decoderRenderer != null) {
+                long lastFrame = decoderRenderer.getLastVideoFrameElapsedRealtime();
+                long nowMs = SystemClock.elapsedRealtime();
+                if (pendingMediaRecoveryConfirmation &&
+                        StreamConnectionHealth.isFreshVideoFrame(
+                                lastFrame, nowMs, VIDEO_STALL_TIMEOUT_MS)) {
+                    confirmStreamRecovered();
+                }
+                if (StreamConnectionHealth.isVideoInactive(
+                        lastFrame, lastSuccessfulConnectionElapsedMs,
+                        nowMs, VIDEO_STALL_TIMEOUT_MS,
+                        !Objects.equals(appUUID, NvApp.REMOTE_INPUT_UUID))) {
+                    beginStreamRecovery("Video stream stopped receiving frames");
+                    return;
+                }
+            }
+            timerHandler.postDelayed(this, STREAM_HEALTH_INTERVAL_MS);
+        }
+    };
     private int suppressPipRefCount = 0;
     private String pcName;
     private String appName;
@@ -207,6 +255,37 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean waitingForAllModifiersUp = false;
     private int specialKeyCode = KeyEvent.KEYCODE_UNKNOWN;
     private StreamContainer streamContainer;
+
+    // KernelSU Nabu relay identity. The relay exposes harmless Android F-key codes
+    // but retains the original Linux scan code for Ctrl/Alt/Meta/Escape/etc.
+    private static final int NABU_REMOTE_HOTKEY_VENDOR_ID = 0x4e42;
+    private static final int NABU_REMOTE_HOTKEY_PRODUCT_ID = 0x4852;
+    private final Set<Integer> nabuRemoteHotkeyDeviceIds = new HashSet<>();
+    private final Set<Integer> nabuRemoteHotkeyPressedScancodes = new HashSet<>();
+    private final InputManager.InputDeviceListener nabuRemoteHotkeyDeviceListener =
+            new InputManager.InputDeviceListener() {
+                @Override
+                public void onInputDeviceAdded(int deviceId) {
+                    updateNabuRemoteHotkeyDevice(deviceId);
+                }
+
+                @Override
+                public void onInputDeviceRemoved(int deviceId) {
+                    if (nabuRemoteHotkeyDeviceIds.remove(deviceId)) {
+                        releaseNabuRemoteHotkeys();
+                    }
+                }
+
+                @Override
+                public void onInputDeviceChanged(int deviceId) {
+                    boolean wasRelay = nabuRemoteHotkeyDeviceIds.contains(deviceId);
+                    updateNabuRemoteHotkeyDevice(deviceId);
+                    if (wasRelay && !nabuRemoteHotkeyDeviceIds.contains(deviceId)) {
+                        releaseNabuRemoteHotkeys();
+                    }
+                }
+            };
+
     private long synthTouchDownTime = 0;
 
     private boolean pendingDrag = false;
@@ -344,6 +423,35 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         instance = this;
         timerHandler = new Handler(Looper.getMainLooper());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            ConnectivityManager networkManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            recoveryNetworkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    timerHandler.post(() -> {
+                        if (pendingReconnect != null && !connected && !connecting && !recoveryStopping) {
+                            timerHandler.removeCallbacks(pendingReconnect);
+                            Runnable retry = pendingReconnect;
+                            pendingReconnect = null;
+                            retry.run();
+                        }
+                    });
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    // A changed/default network path invalidates the UDP/TCP stream.
+                    // Moonlight native callbacks may not arrive promptly on a silent loss.
+                    timerHandler.post(() -> {
+                        if (sessionDesired && attemptedConnection &&
+                                (connected || connecting) && !recoveryStopping) {
+                            beginStreamRecovery("Android network connection lost");
+                        }
+                    });
+                }
+            };
+            networkManager.registerDefaultNetworkCallback(recoveryNetworkCallback);
+        }
 
         UiHelper.setLocale(this);
 
@@ -516,6 +624,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
 
         notificationOverlayView = findViewById(R.id.notificationOverlay);
+        connectionStateBanner = findViewById(R.id.connectionStateBanner);
 
         performanceOverlayView = findViewById(R.id.performanceOverlay);
 
@@ -811,6 +920,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         inputManager.registerInputDeviceListener(keyboardTranslator, null);
+        inputManager.registerInputDeviceListener(nabuRemoteHotkeyDeviceListener, null);
+        for (int deviceId : InputDevice.getDeviceIds()) {
+            updateNabuRemoteHotkeyDevice(deviceId);
+        }
 
         // Initialize trackpad contexts
         for (int i = 0; i < trackpadContextMap.length; i++) {
@@ -865,16 +978,21 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         //streamContainer.getHolder().addCallback(this);
 
         streamContainer.setOnSurfaceAvailable(() -> {
+            Surface surface = streamContainer.getSurface();
+            if (surface == null || !surface.isValid()) return;
             if (!attemptedConnection) {
-                LimeLog.info("Surface is available, starting connection...");
+                LimeLog.info("Surface available, starting managed session");
                 attemptedConnection = true;
-
-                // Der Decoder erhält die jeweils aktive Oberfläche vom Container
-                decoderRenderer.setRenderTarget(streamContainer.getSurface());
-
-                // Starten Sie die NvConnection
-                conn.start(new AndroidAudioRenderer(Game.this, prefConfig.playHostAudio),
+                connecting = true;
+                decoderRenderer.setRenderTarget(surface);
+                StreamSessionService.start(Game.this);
+                conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
                         decoderRenderer, Game.this);
+                armConnectionStartTimeout();
+            } else if (streamVisible && (connected || connecting)) {
+                if (!decoderRenderer.restoreVideoSurface(surface)) {
+                    beginStreamRecovery("Could not restore display Surface");
+                }
             }
         });
 
@@ -1403,6 +1521,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
 
+        if (!hasFocus) {
+            // The relay may disappear or release keys while Android no longer
+            // delivers events to this Activity. Release host-side VK state now.
+            releaseNabuRemoteHotkeys();
+        }
+
         // We can't guarantee the state of modifiers keys which may have
         // lifted while focus was not on us. Clear the modifier state.
         this.modifierFlags = 0;
@@ -1699,7 +1823,70 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        streamVisible = true;
+        if (controllerHandler != null) controllerHandler.enableSensors();
+        // Restoring a live session must also restore pointer/keyboard capture.
+        timerHandler.postDelayed(() -> {
+            if (streamVisible && connected && hasWindowFocus() && !isFinishing()) {
+                setInputGrabState(true);
+            }
+        }, 100);
+        if (connected && !recoveryStopping) {
+            // If Android paused our timers while the application was
+            // backgrounded, check video health immediately on resume.
+            timerHandler.removeCallbacks(streamHealthCheck);
+            timerHandler.post(streamHealthCheck);
+        }
+        if (decoderRenderer != null && streamContainer != null && attemptedConnection) {
+            Surface surface = streamContainer.getSurface();
+            if (surface != null && surface.isValid() && (connected || connecting)) {
+                if (!decoderRenderer.restoreVideoSurface(surface)) {
+                    beginStreamRecovery("Failed to reattach video Surface");
+                }
+            }
+            if (!connected && !connecting && !recoveryStopping &&
+                    pendingReconnect == null && sessionDesired) {
+                if (reconnectCycle.getPhase() == StreamReconnectCycle.Phase.WAITING) {
+                    // Cleanup already finished; do not perform it a second time.
+                    scheduleStreamReconnect();
+                } else {
+                    // Never bypass disconnect when recovering after resume.
+                    beginStreamRecovery("Resume found an inactive stream");
+                }
+            }
+        }
+    }
+
+    @Override
     protected void onDestroy() {
+        sessionDesired = false;
+        reconnectCycle.close();
+        if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+        pendingReconnect = null;
+        cancelConnectionStartTimeout();
+        timerHandler.removeCallbacks(streamHealthCheck);
+        if (recoveryBannerHide != null) timerHandler.removeCallbacks(recoveryBannerHide);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && recoveryNetworkCallback != null) {
+            ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE))
+                    .unregisterNetworkCallback(recoveryNetworkCallback);
+        }
+        if (conn != null && (connected || connecting)) stopConnection();
+        if (conn != null && attemptedConnection && !finalCleanupEnqueued) {
+            // A connection may be in retry backoff when the Activity is destroyed.
+            // Cancel any outstanding HTTP/native work and free its parked Surface,
+            // even when neither connected nor connecting is true.
+            finalCleanupEnqueued = true;
+            new Thread(() -> {
+                try {
+                    conn.stop();
+                } finally {
+                    if (decoderRenderer != null) decoderRenderer.releaseParkedSurface();
+                }
+            }, "Artemis - final cleanup").start();
+        }
+        StreamSessionService.stop(this);
         super.onDestroy();
 
         instance = null;
@@ -1713,6 +1900,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (keyboardTranslator != null) {
             InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
             inputManager.unregisterInputDeviceListener(keyboardTranslator);
+            inputManager.unregisterInputDeviceListener(nabuRemoteHotkeyDeviceListener);
         }
 
         if (lowLatencyWifiLock != null) {
@@ -1744,6 +1932,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     protected void onPause() {
+        // Never retain pointer/keyboard capture when another app has focus.
+        if (inputCaptureProvider != null) setInputGrabState(false);
+        if (controllerHandler != null) controllerHandler.disableSensors();
         if (isFinishing()) {
             // Stop any further input device notifications before we lose focus (and pointer capture)
             if (controllerHandler != null) {
@@ -1760,6 +1951,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     @Override
     protected void onStop() {
         super.onStop();
+        streamVisible = false;
+        if (!isFinishing()) {
+            // Activity visibility is not session lifetime.
+            if (decoderRenderer != null && (connected || connecting)) {
+                if (!decoderRenderer.parkVideoSurface()) {
+                    beginStreamRecovery("Decoder cannot render without Activity Surface");
+                }
+            }
+            return;
+        }
+        sessionDesired = false;
+        if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+        pendingReconnect = null;
+        StreamSessionService.stop(this);
 
         SpinnerDialog.closeDialogs(this);
         Dialog.closeDialogs();
@@ -1862,6 +2067,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     private void setInputGrabState(boolean grab) {
+        if (!grab) {
+            releaseNabuRemoteHotkeys();
+        }
+
         // Grab/ungrab the mouse cursor
         if (grab) {
             inputCaptureProvider.enableCapture();
@@ -2036,6 +2245,103 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         return (byte) modifierFlags;
     }
 
+    private boolean isNabuRemoteHotkeyRelay(InputDevice device) {
+        return device != null &&
+                device.getVendorId() == NABU_REMOTE_HOTKEY_VENDOR_ID &&
+                device.getProductId() == NABU_REMOTE_HOTKEY_PRODUCT_ID;
+    }
+
+    private void updateNabuRemoteHotkeyDevice(int deviceId) {
+        InputDevice device = InputDevice.getDevice(deviceId);
+        if (isNabuRemoteHotkeyRelay(device)) {
+            nabuRemoteHotkeyDeviceIds.add(deviceId);
+        } else {
+            nabuRemoteHotkeyDeviceIds.remove(deviceId);
+        }
+    }
+
+    /**
+     * Handle the dedicated KernelSU hotkey relay before Android-keycode
+     * translation. Its Android key codes are intentionally harmless surrogates;
+     * the Linux scan code is the authoritative identity sent to the host.
+     */
+    private boolean handleNabuRemoteHotkeyRelay(KeyEvent event, boolean down) {
+        if (!isNabuRemoteHotkeyRelay(event.getDevice())) {
+            return false;
+        }
+
+        final int scanCode = event.getScanCode();
+        final short translated = keyboardTranslator != null
+                ? keyboardTranslator.translateRawScancode(scanCode) : 0;
+
+        // Always consume events from this trusted relay so surrogate F13-F20
+        // keycodes can never leak through the ordinary Android translation path.
+        if (translated == 0 || conn == null || !grabbedInput) {
+            if (!down) {
+                nabuRemoteHotkeyPressedScancodes.remove(scanCode);
+            }
+            return true;
+        }
+
+        if (down) {
+            if (event.getRepeatCount() > 0 || !nabuRemoteHotkeyPressedScancodes.add(scanCode)) {
+                return true;
+            }
+        } else if (!nabuRemoteHotkeyPressedScancodes.remove(scanCode)) {
+            return true;
+        }
+
+        conn.sendKeyboardInput(translated,
+                down ? KeyboardPacket.KEY_DOWN : KeyboardPacket.KEY_UP,
+                (byte) 0, MoonBridge.SS_KBE_FLAG_NON_NORMALIZED);
+        return true;
+    }
+
+    private void releaseNabuRemoteHotkeys() {
+        if (nabuRemoteHotkeyPressedScancodes.isEmpty()) {
+            return;
+        }
+
+        if (conn != null && keyboardTranslator != null) {
+            for (Integer scanCode : new HashSet<>(nabuRemoteHotkeyPressedScancodes)) {
+                short translated = keyboardTranslator.translateRawScancode(scanCode);
+                if (translated != 0) {
+                    conn.sendKeyboardInput(translated, KeyboardPacket.KEY_UP,
+                            (byte) 0, MoonBridge.SS_KBE_FLAG_NON_NORMALIZED);
+                }
+            }
+        }
+        nabuRemoteHotkeyPressedScancodes.clear();
+    }
+
+    /**
+     * Keep keyboard Escape from falling back to Android Back navigation.
+     *
+     * Android key character maps can redispatch unhandled Escape as Back,
+     * which opens Artemis's session menu through onBackPressed(). Handle
+     * Escape before the synthetic-key and input-grab filters, and keep
+     * physical/system Back navigation unchanged.
+     */
+    private boolean handleStreamEscapeKey(KeyEvent event, boolean down) {
+        if (!StreamEscapeKeyPolicy.isRemoteEscape(event)) {
+            return false;
+        }
+
+        // Preserve the existing Ctrl+Alt+Shift client shortcut state.
+        if (handleSpecialKeys(KeyEvent.KEYCODE_ESCAPE, down)) {
+            return true;
+        }
+
+        // If keyboard input is released to Android, consume Escape to prevent
+        // Back fallback but do not inject an ungrabbed key into the host.
+        if (grabbedInput && conn != null && (!down || event.getRepeatCount() == 0)) {
+            conn.sendKeyboardInput((short) KeyboardTranslator.VK_ESCAPE,
+                    down ? KeyboardPacket.KEY_DOWN : KeyboardPacket.KEY_UP,
+                    getModifierState(event), (byte) 0);
+        }
+        return true;
+    }
+
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         return handleKeyDown(event) || super.onKeyDown(keyCode, event);
@@ -2043,6 +2349,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyDown(KeyEvent event) {
+        if (handleNabuRemoteHotkeyRelay(event, true)) {
+            return true;
+        }
+        if (handleStreamEscapeKey(event, true)) {
+            return true;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
@@ -2134,6 +2447,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyUp(KeyEvent event) {
+        if (handleNabuRemoteHotkeyRelay(event, false)) {
+            return true;
+        }
+        if (handleStreamEscapeKey(event, false)) {
+            return true;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
@@ -3451,8 +3771,180 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void stageComplete(String stage) {
     }
 
+    private void showConnectionState(String text) {
+        if (recoveryBannerHide != null) {
+            timerHandler.removeCallbacks(recoveryBannerHide);
+            recoveryBannerHide = null;
+        }
+        if (connectionStateBanner != null) {
+            connectionStateBanner.setText(text);
+            connectionStateBanner.setContentDescription(text);
+            connectionStateBanner.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void confirmStreamRecovered() {
+        pendingMediaRecoveryConfirmation = false;
+        hasRecoveredFromFailure = false;
+        StreamSessionService.start(this);
+        showConnectionState(getString(R.string.stream_recovery_connected));
+        recoveryBannerHide = () -> {
+            if (connected && !recoveryStopping) clearConnectionState();
+        };
+        timerHandler.postDelayed(recoveryBannerHide, 3000L);
+    }
+
+    private void clearConnectionState() {
+        if (recoveryBannerHide != null) timerHandler.removeCallbacks(recoveryBannerHide);
+        recoveryBannerHide = null;
+        if (connectionStateBanner != null) connectionStateBanner.setVisibility(View.GONE);
+    }
+
+    private void cancelConnectionStartTimeout() {
+        if (connectionStartTimeout != null) timerHandler.removeCallbacks(connectionStartTimeout);
+        connectionStartTimeout = null;
+    }
+
+    private void armConnectionStartTimeout() {
+        cancelConnectionStartTimeout();
+        final long generation = conn.getAttemptGeneration();
+        connectionStartTimeout = () -> {
+            connectionStartTimeout = null;
+            if (sessionDesired && connecting && !recoveryStopping &&
+                    generation == conn.getAttemptGeneration()) {
+                beginStreamRecovery("Connection attempt timed out after 45 seconds");
+            }
+        };
+        timerHandler.postDelayed(connectionStartTimeout, CONNECTION_START_TIMEOUT_MS);
+    }
+
+    /**
+     * A transient failure owns exactly one stop -> retry transition.
+     * No UI Activity recreation is necessary while this Activity remains alive.
+     */
+    private void beginStreamRecovery(String reason) {
+        if (!sessionDesired || !attemptedConnection || isFinishing() || isDestroyed()
+                || recoveryStopping || pendingReconnect != null) return;
+
+        // A recovery round cannot start until its predecessor has been
+        // disconnected and the native connection permit released.
+        final long round = reconnectCycle.beginDisconnect();
+        if (round < 0) return;
+        LimeLog.warning("Recovering streaming session [" + round + "]: " + reason);
+        if (connected) {
+            recoveryPolicy.onStreamEnded(lastSuccessfulConnectionElapsedMs,
+                    SystemClock.elapsedRealtime());
+        }
+        cancelConnectionStartTimeout();
+        timerHandler.removeCallbacks(streamHealthCheck);
+        hasRecoveredFromFailure = true;
+        pendingMediaRecoveryConfirmation = false;
+        showConnectionState(getString(R.string.stream_connection_lost) + "\n" +
+                getString(R.string.stream_recovery_preparing));
+        recoveryStopping = true;
+        connecting = false;
+        connected = false;
+        updatePipAutoEnter();
+        if (spinner != null) {
+            spinner.dismiss();
+            spinner = null;
+        }
+        if (inputCaptureProvider != null) setInputGrabState(false);
+        if (decoderRenderer != null) decoderRenderer.prepareForStop();
+        StreamSessionService.reconnecting(this);
+
+        new Thread(() -> {
+            RuntimeException cleanupError = null;
+            try {
+                // Blocking stop: no new session until native bridge, codec
+                // and global MoonBridge permit are released.
+                if (conn != null) conn.stop();
+            } catch (RuntimeException e) {
+                cleanupError = e;
+                LimeLog.warning("Unable to fully disconnect old stream: " + e);
+            }
+            final RuntimeException error = cleanupError;
+            runOnUiThread(() -> {
+                // An obsolete stop completion cannot restart a newer session.
+                if (!reconnectCycle.disconnected(round)) return;
+                recoveryStopping = false;
+                if (!sessionDesired || isFinishing() || isDestroyed()) return;
+                if (error != null) {
+                    // We cannot safely claim a fresh connection while the
+                    // predecessor may still be alive inside MoonBridge.
+                    sessionDesired = false;
+                    reconnectCycle.close();
+                    showConnectionState(getString(R.string.stream_recovery_cleanup_failed));
+                    StreamSessionService.stop(Game.this);
+                    return;
+                }
+                scheduleStreamReconnect();
+            });
+        }, "Artemis - recovery cleanup").start();
+    }
+
+    private void scheduleStreamReconnect() {
+        scheduleStreamReconnect(true);
+    }
+
+    private void scheduleStreamReconnect(boolean countTransportFailure) {
+        if (!sessionDesired || !attemptedConnection || recoveryStopping
+                || connected || connecting || pendingReconnect != null
+                || reconnectCycle.getPhase() != StreamReconnectCycle.Phase.WAITING
+                || isFinishing() || isDestroyed()) return;
+
+        // Waiting for a Surface is not a transport failure.
+        long delay = countTransportFailure
+                ? recoveryPolicy.nextDelayMillis() : 1000L;
+        final int attemptNumber = Math.max(1, recoveryPolicy.getFailureCount());
+        final long round = reconnectCycle.currentRound();
+        final String waitMessage = getString(R.string.stream_recovery_waiting,
+                attemptNumber, Math.max(1L, (delay + 999L) / 1000L));
+        showConnectionState(getString(R.string.stream_connection_lost) + "\n" + waitMessage);
+        StreamSessionService.reconnecting(this, waitMessage);
+        pendingReconnect = () -> {
+            pendingReconnect = null;
+            if (!sessionDesired || isFinishing() || isDestroyed()
+                    || recoveryStopping || connected || connecting ||
+                    !reconnectCycle.isWaiting(round)) return;
+
+            Surface surface = streamContainer == null ? null : streamContainer.getSurface();
+            boolean targetReady;
+            if (streamVisible && surface != null && surface.isValid()) {
+                targetReady = decoderRenderer.restoreVideoSurface(surface);
+            } else {
+                targetReady = decoderRenderer.parkVideoSurface();
+            }
+            if (!targetReady || !decoderRenderer.hasUsableRenderTarget()) {
+                LimeLog.warning("Reconnect waiting for a usable decoder Surface");
+                scheduleStreamReconnect(false);
+                return;
+            }
+
+            if (!reconnectCycle.beginConnect(round)) return;
+            LimeLog.info("Trying Artemis streaming session reconnect, round " +
+                    round + ", attempt " + attemptNumber);
+            connecting = true;
+            displayedFailureDialog = false;
+            final String progress = getString(R.string.stream_recovery_attempt, attemptNumber);
+            showConnectionState(progress);
+            StreamSessionService.reconnecting(this, progress);
+            conn.setRecoveryMode(true);
+            try {
+                conn.start(new AndroidAudioRenderer(getApplicationContext(), prefConfig.playHostAudio),
+                        decoderRenderer, this);
+                armConnectionStartTimeout();
+            } catch (RuntimeException e) {
+                LimeLog.warning("Reconnect start failed synchronously: " + e);
+                beginStreamRecovery("Unable to start native session");
+            }
+        };
+        timerHandler.postDelayed(pendingReconnect, delay);
+    }
+
     private void stopConnection() {
         if (connecting || connected) {
+            if (!sessionDesired) finalCleanupEnqueued = true;
             connecting = connected = false;
             updatePipAutoEnter();
 
@@ -3469,6 +3961,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             new Thread() {
                 public void run() {
                     conn.stop();
+                    if (!sessionDesired && decoderRenderer != null) {
+                        decoderRenderer.releaseParkedSurface();
+                    }
                     if (httpConn != null && quitOnStop) {
                         try {
                             sleep(1000);
@@ -3485,14 +3980,34 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public boolean stageFailed(final String stage, final int portFlags, final int errorCode) {
-        // Perform a connection test if the failure could be due to a blocked port
-        // This does network I/O, so don't do it on the main thread.
-        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
-
-        if (errorCode == 0 && portFlags != 0 && (portTestResult == MoonBridge.ML_TEST_RESULT_INCONCLUSIVE || portTestResult == 0)) {
-            spinner.setMessage(getResources().getString(R.string.unlocking_or_starting));
-            return true;
+        if (!sessionDesired || isFinishing() || isDestroyed()) return false;
+        // Auth/ownership errors need user action; retry only transport-like failures.
+        if (sessionDesired && !conn.isPermanentStartFailure() && errorCode != 403
+                && errorCode != 470 && errorCode != 599
+                && (stage == null || !stage.toLowerCase(java.util.Locale.ROOT).contains("pair"))) {
+            final long failureGeneration = conn.getAttemptGeneration();
+            runOnUiThread(() -> {
+                if (failureGeneration == conn.getAttemptGeneration()) {
+                    beginStreamRecovery("Stage failed: " + stage + " (" + errorCode + ")");
+                }
+            });
+            return false;
         }
+        // Permanent host/pairing error: never override a server-side
+        // decision by blindly reconnecting.
+        sessionDesired = false;
+        reconnectCycle.close();
+        runOnUiThread(() -> {
+            cancelConnectionStartTimeout();
+            timerHandler.removeCallbacks(streamHealthCheck);
+            showConnectionState(getString(R.string.stream_recovery_needs_attention));
+            StreamSessionService.stop(Game.this);
+        });
+
+        // Connectivity diagnosis does I/O and must remain off the UI thread.
+        final int portTestResult = portFlags == 0
+                ? MoonBridge.ML_TEST_RESULT_INCONCLUSIVE
+                : MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
 
         runOnUiThread(new Runnable() {
             @Override
@@ -3508,7 +4023,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                     // If video initialization failed and the surface is still valid, display extra information for the user
                     Surface currentSurface = streamContainer.getSurface();
-                    if (stage.contains("video") && currentSurface != null && currentSurface.isValid()) {
+                    if (stage != null && stage.contains("video") &&
+                            currentSurface != null && currentSurface.isValid()) {
                         Toast.makeText(Game.this, getResources().getText(R.string.video_decoder_init_failed), Toast.LENGTH_LONG).show();
                     }
 
@@ -3561,6 +4077,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionTerminated(final int errorCode) {
+        if (!sessionDesired || isFinishing() || isDestroyed()) return;
+        if (sessionDesired && !isFinishing()
+                && errorCode != MoonBridge.ML_ERROR_PROTECTED_CONTENT
+                && errorCode != MoonBridge.ML_ERROR_GRACEFUL_TERMINATION) {
+            runOnUiThread(() -> beginStreamRecovery("Transport ended: " + errorCode));
+            return;
+        }
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
@@ -3675,9 +4198,17 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionStarted() {
+        if (!sessionDesired || isFinishing() || isDestroyed()) return;
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                if (!sessionDesired || !connecting || recoveryStopping) return;
+                cancelConnectionStartTimeout();
+                // Do not reset retry backoff for a brief reconnect handshake.
+                // A subsequent recovery resets only after a stable session.
+                conn.setRecoveryMode(false);
+                if (pendingReconnect != null) timerHandler.removeCallbacks(pendingReconnect);
+                pendingReconnect = null;
                 if (spinner != null) {
                     spinner.dismiss();
                     spinner = null;
@@ -3685,6 +4216,27 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                 connected = true;
                 connecting = false;
+                reconnectCycle.connected();
+                lastSuccessfulConnectionElapsedMs = SystemClock.elapsedRealtime();
+                timerHandler.removeCallbacks(streamHealthCheck);
+                timerHandler.postDelayed(streamHealthCheck, STREAM_HEALTH_INTERVAL_MS);
+                if (hasRecoveredFromFailure) {
+                    if (Objects.equals(appUUID, NvApp.REMOTE_INPUT_UUID)) {
+                        // Input-only sessions cannot confirm via video.
+                        confirmStreamRecovered();
+                    } else {
+                        // A native connected callback is not proof that the
+                        // remote desktop can render. Keep the indicator visible
+                        // until the decoder actually receives a video frame.
+                        pendingMediaRecoveryConfirmation = true;
+                        String waiting = getString(R.string.stream_recovery_waiting_video);
+                        showConnectionState(waiting);
+                        StreamSessionService.reconnecting(Game.this, waiting);
+                    }
+                } else {
+                    StreamSessionService.start(Game.this);
+                    clearConnectionState();
+                }
                 updatePipAutoEnter();
 
                 // Hide the mouse cursor now after a short delay.
@@ -3695,7 +4247,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 timerHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        setInputGrabState(true);
+                        if (hasWindowFocus() && streamVisible) setInputGrabState(true);
                     }
                 }, 500);
 
@@ -3845,16 +4397,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        if (!surfaceCreated) {
-            throw new IllegalStateException("Surface destroyed before creation!");
-        }
-
-        if (attemptedConnection) {
-            // Let the decoder know immediately that the surface is gone
-            decoderRenderer.prepareForStop();
-
-            if (connected) {
-                stopConnection();
+        surfaceCreated = false;
+        if (attemptedConnection && (connected || connecting) && decoderRenderer != null) {
+            if (!decoderRenderer.parkVideoSurface()) {
+                beginStreamRecovery("Video display Surface destroyed");
             }
         }
     }
