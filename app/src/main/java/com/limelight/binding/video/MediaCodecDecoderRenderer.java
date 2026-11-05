@@ -374,7 +374,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
         try {
             if (parkedSurface == null) {
-                parkedTexture = new SurfaceTexture(0);
+                // API 26+ supports detached SurfaceTexture creation without
+                // requiring an OpenGL texture/context (the stream is parked
+                // with decoded output buffers discarded, not rendered).
+                // SurfaceTexture(0) attaches to texture name zero, which is
+                // unreliable on some Android GPU/codec combinations.
+                parkedTexture = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                        ? new SurfaceTexture(false) : new SurfaceTexture(0);
                 parkedTexture.setDefaultBufferSize(16, 16);
                 parkedSurface = new Surface(parkedTexture);
             }

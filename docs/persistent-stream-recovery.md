@@ -139,3 +139,15 @@ lifecycle into a process-persistent service.
   session is flagged after the video inactivity threshold.
 - Confirm no false reconnect on short network jitter, that manual Disconnect
   cancels retries, and that the Stable app remains unaffected.
+
+### Headless video Surface on Android 8+
+
+On Android API 26+, the parked video target now uses the documented
+`SurfaceTexture(false)` constructor, which starts detached from an OpenGL
+texture. The previous `SurfaceTexture(0)` path remains as a fallback for
+older supported Android versions. Decoder output is discarded while parked,
+and the real display Surface is restored when returning to the app. Some
+device codecs reject `MediaCodec.setOutputSurface` even for supported
+Surface types; these failures must trigger full recovery instead of claiming
+the live stream was preserved. This compatibility change is grounded in the
+Android platform API contract but still requires device validation on MIUI.
